@@ -1,3 +1,10 @@
+sandbox (2.3.0-1) unstable; urgency=medium
+
+  * minor fixes and cleanup
+
+ -- Sergey Svistunov <sergey-svistunov@yandex.ru>  Sat, 11 Apr 2026 16:30:00 +0000
+
+
 sandbox (2.2.0-1) unstable; urgency=medium
 
   * minor fixes
