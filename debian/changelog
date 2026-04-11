@@ -1,3 +1,10 @@
+sandbox (2.2.0-1) unstable; urgency=medium
+
+  * minor fixes
+
+ -- Sergey Svistunov <sergey-svistunov@yandex.ru>  Sun, 8 Mar 2026 108:24:03 +0000
+
+
 sandbox (2.1.0-1) unstable; urgency=medium
 
   * Remove bootstrap dependency

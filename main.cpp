@@ -12,9 +12,13 @@
 #include <sys/wait.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <sys/sysmacros.h>
+#include <sys/mman.h>
+#include <fcntl.h>
 #include <mntent.h>
 #include <libcgroup.h>
-#include <immintrin.h>
 
 
 #define STACK_SIZE (1024 * 1024)
@@ -29,9 +33,12 @@ struct exe_opts {
     const fs::path &exec_dir;
 };
 
+static volatile sig_atomic_t got_signal = 0;
 static pid_t pid;
 static fs::path sandbox = {};
 static cgroup *sandbox_cgroup = nullptr;
+static uid_t caller_uid;
+static gid_t caller_gid;
 
 void fatal(const std::string &message) {
     std::cerr << message << std::endl;
@@ -48,26 +55,95 @@ void fatal_cgroup(const std::string &message) {
     exit(EXIT_FAILURE);
 }
 
+// Execute a command without shell interpolation (fix: command injection via popen)
+std::string exec_command(const char *path, std::vector<const char *> args) {
+    int pipefd[2];
+    if (pipe(pipefd))
+        fatal_errno("cannot create pipe");
+
+    pid_t child = fork();
+    if (child == -1)
+        fatal_errno("cannot fork");
+
+    if (child == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+        execv(path, const_cast<char *const *>(args.data()));
+        _exit(EXIT_FAILURE);
+    }
+
+    close(pipefd[1]);
+
+    std::string result;
+    char buf[256];
+    ssize_t n;
+    while ((n = read(pipefd[0], buf, sizeof(buf))) > 0)
+        result.append(buf, n);
+    close(pipefd[0]);
+
+    waitpid(child, nullptr, 0);
+    return result;
+}
+
+// Validate sandbox path is safe (fix: unvalidated sandbox path)
+void validate_sandbox_path(const fs::path &path) {
+    if (!path.is_absolute())
+        fatal("sandbox path must be absolute");
+
+    fs::path normalized = path.lexically_normal();
+    for (const auto &component : normalized) {
+        if (component == "..")
+            fatal("sandbox path must not contain '..'");
+    }
+
+    static const std::vector<std::string> forbidden = {
+        "/", "/bin", "/sbin", "/usr", "/etc", "/var", "/home", "/root",
+        "/boot", "/lib", "/lib64", "/dev", "/proc", "/sys", "/run", "/tmp"
+    };
+    std::string norm_str = normalized.string();
+    if (norm_str.size() > 1 && norm_str.back() == '/')
+        norm_str.pop_back();
+    for (const auto &f : forbidden) {
+        if (norm_str == f)
+            fatal("sandbox path must not be a critical system directory: " + f);
+    }
+}
+
+// Validate destination path doesn't escape sandbox via .. traversal (fix: path traversal)
+void validate_path_in_sandbox(const fs::path &dst, const std::string &desc) {
+    auto normalized = dst.lexically_normal();
+    for (const auto &component : normalized) {
+        if (component == "..")
+            fatal(desc + " escapes sandbox: " + dst.string());
+    }
+}
+
+// Validate cgroup name has no path traversal (fix: cgroup name path traversal)
+void validate_cgroup_name(const std::string &name) {
+    if (name.empty())
+        return;
+    if (name.find('/') != std::string::npos || name.find("..") != std::string::npos)
+        fatal("cgroup name must not contain '/' or '..'");
+    if (name[0] == '.')
+        fatal("cgroup name must not start with '.'");
+}
+
 void path_pids(std::vector<int> &res) {
     if (!fs::exists(sandbox)) {
         return;
     }
 
-    std::array<char, 256> buffer{};
-    std::string out_buf;
-
-    const std::string lsof_cmd =
-        "/usr/bin/lsof -n -w -Fp +d " + sandbox.string();
-
-    using Pipe = std::unique_ptr<FILE, int (*)(FILE *)>;
-    Pipe pipe(popen(lsof_cmd.c_str(), "r"), pclose);
-    if (!pipe) {
-        fatal("cannot get path pids");
-    }
-
-    while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe.get()) != nullptr) {
-        out_buf.append(buffer.data());
-    }
+    std::string sandbox_str = sandbox.string();
+    std::vector<const char *> args = {
+        "/usr/bin/lsof", "-n", "-w", "-Fp", "+d", sandbox_str.c_str(), nullptr
+    };
+    std::string out_buf = exec_command("/usr/bin/lsof", args);
 
     static const std::regex re(R"(p([0-9]+))");
 
@@ -97,7 +173,7 @@ void kill_all_sandbox_processes() {
 }
 
 void remove_sandbox_path() {
-    if (!fs::exists(sandbox)) { ;
+    if (!fs::exists(sandbox)) {
         return;
     }
 
@@ -111,10 +187,14 @@ void remove_sandbox_path() {
         while (++i) {
             if (umount2(mounts->mnt_dir, MNT_FORCE)) {
                 if (errno == EBUSY) {
+                    if (i > 1000) {
+                        std::cerr << "cannot umount " << mounts->mnt_dir << ": busy after 1000 retries" << std::endl;
+                        break;
+                    }
                     if (i % 50 == 0)
                         std::cerr << "cannot umount: busy, retry" << std::endl;
 
-                    sleep(0);
+                    usleep(10000);
                     continue;
                 }
                 fatal_errno(std::string("cannot umount ") + mounts->mnt_dir);
@@ -125,7 +205,7 @@ void remove_sandbox_path() {
     endmntent(mounts_f);
 
     std::error_code ec;
-    fs::remove_all(sandbox, ec) < 0;
+    fs::remove_all(sandbox, ec);
     if (ec)
         fatal("cannot remove sandbox: " + ec.message());
 }
@@ -157,21 +237,39 @@ void init_dirs() {
         fatal_errno("cannot set mode 777 for /tmp");
 }
 
+// Create minimal device nodes instead of full devtmpfs (fix: devtmpfs exposes all devices)
+void create_dev_nodes() {
+    struct dev_node {
+        const char *name;
+        mode_t mode;
+        unsigned int major;
+        unsigned int minor;
+    };
+
+    static const dev_node devices[] = {
+        {"null",    S_IFCHR | 0666, 1, 3},
+        {"zero",    S_IFCHR | 0666, 1, 5},
+        {"full",    S_IFCHR | 0666, 1, 7},
+        {"random",  S_IFCHR | 0666, 1, 8},
+        {"urandom", S_IFCHR | 0666, 1, 9},
+    };
+
+    mode_t old_umask = umask(0);
+    for (const auto &d : devices) {
+        auto path = sandbox / "dev" / d.name;
+        if (mknod(path.c_str(), d.mode, makedev(d.major, d.minor)))
+            if (errno != EEXIST)
+                fatal_errno(std::string("cannot create device ") + d.name);
+    }
+    umask(old_umask);
+}
+
 void libs_deps(fs::path &bin, std::vector<std::string> &res) {
-    std::array<char, 256> buffer{};
-    std::string out_buf;
-
-    const std::string cmd = "/usr/bin/ldd " + bin.string();
-
-    using Pipe = std::unique_ptr<FILE, int (*)(FILE *)>;
-    Pipe pipe(popen(cmd.c_str(), "r"), pclose);
-    if (!pipe) {
-        fatal("cannot get libraries dependencies");
-    }
-
-    while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe.get()) != nullptr) {
-        out_buf.append(buffer.data());
-    }
+    std::string bin_str = bin.string();
+    std::vector<const char *> args = {
+        "/usr/bin/ldd", bin_str.c_str(), nullptr
+    };
+    std::string out_buf = exec_command("/usr/bin/ldd", args);
 
     static const std::regex re(R"((?:.+?\s+=>)?\s+(/.+?)\s+\(.+?\))");
 
@@ -185,20 +283,15 @@ void libs_deps(fs::path &bin, std::vector<std::string> &res) {
     }
 }
 
+// Use realpath for atomic symlink resolution (fix: TOCTOU race)
 void create_hardlink(const fs::path &src, const fs::path &dst) {
     std::error_code ec;
 
-    fs::path real_path = src;
-    if (fs::is_symlink(src)) {
-        auto target = fs::read_symlink(src, ec);
-        if (ec)
-            fatal("cannot read symlink shared link: " + ec.message());
-
-        if (target.has_root_path())
-            real_path = target;
-        else
-            real_path = fs::path(src).parent_path() / target;
-    }
+    char *resolved = realpath(src.c_str(), nullptr);
+    if (!resolved)
+        fatal_errno("cannot resolve path: " + src.string());
+    fs::path real_path(resolved);
+    free(resolved);
 
     fs::create_directories(dst.parent_path(), ec);
     if (ec)
@@ -222,6 +315,7 @@ void create_hardlink(const fs::path &src, const fs::path &dst) {
 }
 
 void add_file(const fs::path &src, const fs::path &dst, bool with_deps) {
+    validate_path_in_sandbox(dst, "add_file destination");
     auto sbox_path = sandbox / dst.relative_path();
 
     create_hardlink(src, sbox_path);
@@ -237,7 +331,8 @@ void add_file(const fs::path &src, const fs::path &dst, bool with_deps) {
 }
 
 void mount_dir(const fs::path &src, const fs::path &dst) {
-    auto sbox_path = sandbox / dst.relative_path();;
+    validate_path_in_sandbox(dst, "mount destination");
+    auto sbox_path = sandbox / dst.relative_path();
 
     std::error_code ec;
     fs::create_directories(sbox_path, ec);
@@ -288,18 +383,34 @@ cgroup *create_cgroup(const std::string &name, const std::string &cpu_set, uint6
 static int _execute(void *arg) {
     auto *opts = static_cast<exe_opts *>(arg);
 
-    if (chroot(sandbox.c_str()))
-        fatal_errno("cannot chroot");
+    // pivot_root instead of chroot (fix: chroot escape)
+    // Make all mounts private to prevent propagation issues with pivot_root
+    if (mount("", "/", "", MS_PRIVATE | MS_REC, nullptr))
+        fatal_errno("cannot make mounts private");
 
-    if (mount("udev", "/dev", "devtmpfs", 0, nullptr))
-        if (errno != EBUSY)
-            fatal_errno("cannot mount /dev");
+    if (mount(sandbox.c_str(), sandbox.c_str(), "", MS_BIND | MS_REC, nullptr))
+        fatal_errno("cannot bind mount sandbox");
 
+    auto put_old_path = sandbox / ".put_old";
+    mkdir(put_old_path.c_str(), 0700);
+
+    if (syscall(SYS_pivot_root, sandbox.c_str(), put_old_path.c_str()))
+        fatal_errno("cannot pivot_root");
+
+    if (chdir("/"))
+        fatal_errno("cannot chdir");
+
+    if (umount2("/.put_old", MNT_DETACH))
+        fatal_errno("cannot unmount old root");
+
+    rmdir("/.put_old");
+
+    // Mount proc inside new root
     if (mount("proc", "/proc", "proc", 0, nullptr))
         if (errno != EBUSY)
             fatal_errno("cannot mount /proc");
 
-    if (chdir(opts->exec_dir.empty() ? "/root": opts->exec_dir.c_str()))
+    if (chdir(opts->exec_dir.empty() ? "/root" : opts->exec_dir.c_str()))
         fatal_errno("cannot chdir");
 
     if (setgid(NOBODY_UID))
@@ -308,6 +419,13 @@ static int _execute(void *arg) {
     if (setuid(NOBODY_UID))
         fatal_errno("cannot set UID");
 
+    // Prevent privilege escalation via SUID binaries (fix: missing CLONE_NEWUSER)
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))
+        fatal_errno("cannot set no_new_privs");
+
+    // Close leaked file descriptors (fix: FD leak into sandbox)
+    syscall(SYS_close_range, 3, ~0U, 0);
+
     execve(opts->bin_path.c_str(), opts->args.data(), opts->env.data());
     fatal("cannot run file: " + std::string(strerror(errno)));
 
@@ -315,9 +433,21 @@ static int _execute(void *arg) {
 }
 
 void save_usage_stat(const std::string &filename, const std::string &cgroup_name) {
+    // Drop privileges when writing stat file (fix: arbitrary file overwrite as root)
+    if (setegid(caller_gid))
+        fatal_errno("cannot drop privileges for stat file");
+    if (seteuid(caller_uid))
+        fatal_errno("cannot drop privileges for stat file");
+
     std::ofstream out(filename);
+
+    if (seteuid(0))
+        fatal_errno("cannot restore privileges");
+    if (setegid(0))
+        fatal_errno("cannot restore privileges");
+
     if (!out.is_open())
-        fatal_errno("cannot create file for usage statistic");
+        fatal("cannot create file for usage statistic");
 
     std::ifstream cpu_usage_in(fs::path("/sys/fs/cgroup") / cgroup_name / "cpu.stat");
     if (cpu_usage_in.is_open()) {
@@ -358,26 +488,50 @@ int execute(const fs::path &bin, const std::vector<char *> &args, const std::vec
         sandbox_cgroup = create_cgroup(cgroup_name, cpu_set, mem_limit);
         if (cgroup_attach_task(sandbox_cgroup))
             fatal_cgroup("cannot attach process to cgroup");
+
+        // Delegate cgroup.kill to caller so they can terminate the sandbox
+        auto kill_path = fs::path("/sys/fs/cgroup") / cgroup_name / "cgroup.kill";
+        if (chown(kill_path.c_str(), caller_uid, caller_gid))
+            fatal_errno("cannot chown cgroup.kill");
     }
 
-    char *stack, *stackTop;
-    stack = static_cast<char *>(malloc(STACK_SIZE));
-    if (stack == nullptr)
-        fatal("cannot allocate stack");
+    // Create minimal device nodes before clone (fix: devtmpfs exposes all devices)
+    create_dev_nodes();
 
-    stackTop = stack + STACK_SIZE;
+    // Allocate stack with mmap and guard page (fix: malloc stack without guard)
+    size_t page_size = sysconf(_SC_PAGESIZE);
+    size_t stack_alloc = STACK_SIZE + page_size;
+    void *stack_area = mmap(nullptr, stack_alloc, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+    if (stack_area == MAP_FAILED)
+        fatal_errno("cannot allocate stack");
+
+    if (mprotect(stack_area, page_size, PROT_NONE))
+        fatal_errno("cannot set stack guard page");
+
+    char *stackTop = static_cast<char *>(stack_area) + stack_alloc;
 
     pid = clone(_execute, stackTop, flags, &opts);
     if (pid == -1)
         fatal("cannot clone");
 
+    // Handle EINTR from signal handler (fix: signal handler race condition)
     int wstatus;
-    waitpid(pid, &wstatus, 0);
+    while (waitpid(pid, &wstatus, 0) == -1) {
+        if (errno == EINTR)
+            continue;
+        fatal_errno("waitpid failed");
+    }
+
+    munmap(stack_area, stack_alloc);
 
     if (!usage_stat_file.empty())
         save_usage_stat(usage_stat_file, cgroup_name);
 
     clean();
+
+    if (got_signal)
+        return EXIT_FAILURE;
 
     return WEXITSTATUS(wstatus);
 }
@@ -420,18 +574,19 @@ args:
     exit(EXIT_FAILURE);
 }
 
+// Async-signal-safe handler (fix: signal handler race condition)
 void signalHandler(int signum) {
-    kill(pid, SIGINT);
-    waitpid(pid, nullptr, 0);
-
-    clean();
-
-    exit(EXIT_SUCCESS);
+    got_signal = signum;
+    if (pid > 0)
+        kill(pid, SIGKILL);
 }
 
 int main(int argc, char *argv[]) {
     if (getuid() != 0 && geteuid() != 0)
         fatal("required root privileges");
+
+    caller_uid = getuid();
+    caller_gid = getgid();
 
     if (setreuid(0, 0))
         fatal_errno("cannot set reuid");
@@ -439,7 +594,10 @@ int main(int argc, char *argv[]) {
     if (argc < 2 || strncmp(argv[1], "--", 2) == 0)
         print_usage();
 
-    sandbox = argv[1];
+    sandbox = fs::path(argv[1]).lexically_normal();
+
+    // Validate sandbox path (fix: unvalidated sandbox path)
+    validate_sandbox_path(sandbox);
 
     init_dirs();
 
@@ -499,6 +657,7 @@ int main(int argc, char *argv[]) {
                 print_usage();
 
             cgroup = argv[i + 1];
+            validate_cgroup_name(cgroup);
 
             i += 2;
 
@@ -547,8 +706,13 @@ int main(int argc, char *argv[]) {
     cmd_args.push_back(nullptr);
     cmd_env.push_back(nullptr);
 
-    signal(SIGINT, signalHandler);
-    signal(SIGTERM, signalHandler);
+    // Use sigaction for reliable signal handling (fix: signal handler race condition)
+    struct sigaction sa = {};
+    sa.sa_handler = signalHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0; // No SA_RESTART so waitpid gets EINTR
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
 
     return execute(cmd, cmd_args, cmd_env, flags, cgroup, cpu_set, mem_limit, usage_stat_file, exec_dir);
 }
