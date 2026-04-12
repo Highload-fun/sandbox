@@ -179,6 +179,8 @@ void remove_sandbox_path() {
 
     // Remove path
     auto mounts_f = setmntent("/proc/mounts", "r");
+    if (!mounts_f)
+        fatal_errno("cannot open /proc/mounts");
     while (auto mounts = getmntent(mounts_f)) {
         if (std::string(mounts->mnt_dir).find(sandbox.string()) != 0)
             continue;
@@ -374,7 +376,7 @@ cgroup *create_cgroup(const std::string &name, const std::string &cpu_set, uint6
         fatal_cgroup("cannot io controller");
     }
 
-    if (cgroup_create_cgroup(cgroup, 0) == ECGROUPNOTEQUAL)
+    if (cgroup_create_cgroup(cgroup, 0) != 0)
         fatal_cgroup("cannot create cgroup");
 
     return cgroup;
