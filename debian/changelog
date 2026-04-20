@@ -1,3 +1,11 @@
+sandbox (2.3.2-1) unstable; urgency=medium
+
+  * use MNT_DETACH so sandbox cleanup never blocks on busy mounts
+    (was MNT_FORCE + 1000x10ms retries, which could pin a checker worker
+    for ~10s per mount and drain the pool)
+
+ -- Sergey Svistunov <sergey-svistunov@yandex.ru>  Mon, 20 Apr 2026 12:00:00 +0000
+
 sandbox (2.3.1-1) unstable; urgency=medium
 
   * fix cgroup creation silently ignoring non-ECGROUPNOTEQUAL errors

@@ -185,24 +185,14 @@ void remove_sandbox_path() {
         if (std::string(mounts->mnt_dir).find(sandbox.string()) != 0)
             continue;
 
-        int i = 0;
-        while (++i) {
-            if (umount2(mounts->mnt_dir, MNT_FORCE)) {
-                if (errno == EBUSY) {
-                    if (i > 1000) {
-                        std::cerr << "cannot umount " << mounts->mnt_dir << ": busy after 1000 retries" << std::endl;
-                        break;
-                    }
-                    if (i % 50 == 0)
-                        std::cerr << "cannot umount: busy, retry" << std::endl;
-
-                    usleep(10000);
-                    continue;
-                }
-                fatal_errno(std::string("cannot umount ") + mounts->mnt_dir);
-            }
-            break;
-        }
+        // MNT_DETACH (lazy unmount) detaches the mount from the filesystem
+        // tree immediately and lets the kernel finish cleanup once references
+        // drop. The previous MNT_FORCE+1000-retry loop could hold a worker
+        // for ~10s per busy mount (e.g. C# bind-mounts of /lib, /usr/lib),
+        // wedging the checker's worker pool when several runs cleaned up
+        // back-to-back.
+        if (umount2(mounts->mnt_dir, MNT_DETACH))
+            fatal_errno(std::string("cannot umount ") + mounts->mnt_dir);
     }
     endmntent(mounts_f);
 
