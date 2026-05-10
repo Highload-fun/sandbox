@@ -1,3 +1,32 @@
+sandbox (2.3.4-1) unstable; urgency=high
+
+  * use clone3(CLONE_INTO_CGROUP) so the sandbox parent is NEVER placed in
+    the per-run cgroup. The 2.3.3 mitigation (parent attaches, then detaches
+    after clone) still left a race window: between cgroup_attach_task and
+    the post-clone detach, a caller writing "1" to cgroup.kill would
+    SIGKILL the parent. SIGKILL bypasses atexit, leaking sandbox bind-mounts
+    of /usr/lib, /lib, /usr/libexec onto the host - which is how host
+    /usr/lib got wiped on 2026-05-10. With CLONE_INTO_CGROUP the parent
+    never enters the cgroup, and chown(cgroup.kill) only happens after the
+    child is in place, so the caller can never reach the parent.
+
+ -- Sergey Svistunov <sergey-svistunov@yandex.ru>  Sun, 10 May 2026 14:50:00 +0000
+
+sandbox (2.3.3-1) unstable; urgency=high
+
+  * detach sandbox parent from the per-run cgroup after clone, so callers
+    writing to cgroup.kill only kill the sandboxed child. Previously the
+    parent was killed too and skipped clean(), leaking host bind-mounts
+    (/usr/lib, /usr/libexec, /lib) which could be deleted by a later
+    mount-unaware cleanup traversing /tmp
+  * remove_sandbox_path: path-component-boundary prefix match, and a
+    re-scan + abort guard so fs::remove_all is never entered while a
+    mount is still live under the sandbox
+  * run clean() via atexit and install signal handlers before init_dirs,
+    so fatal_* and early SIGTERM no longer leak mounts
+
+ -- Sergey Svistunov <sergey-svistunov@yandex.ru>  Tue, 21 Apr 2026 12:00:00 +0000
+
 sandbox (2.3.2-1) unstable; urgency=medium
 
   * use MNT_DETACH so sandbox cleanup never blocks on busy mounts
