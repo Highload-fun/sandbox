@@ -17,13 +17,21 @@
 #include <sys/sysmacros.h>
 #include <sys/mman.h>
 #include <fcntl.h>
+#include <grp.h>            // setgroups
 #include <mntent.h>
 #include <linux/sched.h>    // struct clone_args, CLONE_INTO_CGROUP
+#include <linux/filter.h>   // sock_filter, sock_fprog, BPF_*
+#include <linux/seccomp.h>  // SECCOMP_*, struct seccomp_data
+#include <linux/audit.h>    // AUDIT_ARCH_X86_64
 #include <libcgroup.h>
 
 // CLONE_INTO_CGROUP not always exposed even by current linux/sched.h
 #ifndef CLONE_INTO_CGROUP
 #define CLONE_INTO_CGROUP 0x200000000ULL
+#endif
+
+#ifndef __NR_clone3
+#define __NR_clone3 435
 #endif
 
 
@@ -407,10 +415,69 @@ cgroup *create_cgroup(const std::string &name, const std::string &cpu_set, uint6
         fatal_cgroup("cannot io controller");
     }
 
+    auto pids_ctrl = cgroup_add_controller(cgroup, "pids");
+    if (!pids_ctrl) {
+        fatal_cgroup("cannot add pids controller");
+    }
+    if (cgroup_set_value_uint64(pids_ctrl, "pids.max", 1024))
+        fatal_cgroup("cannot set pids.max");
+
     if (cgroup_create_cgroup(cgroup, 0) != 0)
         fatal_cgroup("cannot create cgroup");
 
     return cgroup;
+}
+
+static void install_seccomp_filter() {
+    struct sock_filter filter[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+
+        BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, 0x40000000, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clone3, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (ENOSYS & SECCOMP_RET_DATA)),
+
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_setns, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_io_uring_setup, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_io_uring_enter, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_io_uring_register, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_add_key, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_request_key, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_keyctl, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_unshare, 0, 4),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0])),
+        BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, CLONE_NEWUSER, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clone, 0, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0])),
+        BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, CLONE_NEWUSER, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_fprog prog = {
+        static_cast<unsigned short>(sizeof(filter) / sizeof(filter[0])),
+        filter,
+    };
+    if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog))
+        fatal_errno("cannot install seccomp filter");
 }
 
 static int _execute(void *arg) {
@@ -438,13 +505,22 @@ static int _execute(void *arg) {
 
     rmdir("/.put_old");
 
-    // Mount proc inside new root
-    if (mount("proc", "/proc", "proc", 0, nullptr))
+    if (mount("proc", "/proc", "proc", 0, "subset=pid,hidepid=2"))
         if (errno != EBUSY)
             fatal_errno("cannot mount /proc");
 
     if (chdir(opts->exec_dir.empty() ? "/root" : opts->exec_dir.c_str()))
         fatal_errno("cannot chdir");
+
+    static const char sandbox_hostname[] = "sandbox";
+    static const char sandbox_domain[] = "(none)";
+    if (sethostname(sandbox_hostname, sizeof(sandbox_hostname) - 1))
+        fatal_errno("cannot set hostname");
+    if (setdomainname(sandbox_domain, sizeof(sandbox_domain) - 1))
+        fatal_errno("cannot set domainname");
+
+    if (setgroups(0, nullptr))
+        fatal_errno("cannot drop supplementary groups");
 
     if (setgid(NOBODY_UID))
         fatal_errno("cannot set GID");
@@ -455,6 +531,8 @@ static int _execute(void *arg) {
     // Prevent privilege escalation via SUID binaries (fix: missing CLONE_NEWUSER)
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))
         fatal_errno("cannot set no_new_privs");
+
+    install_seccomp_filter();
 
     // Close leaked file descriptors (fix: FD leak into sandbox)
     syscall(SYS_close_range, 3, ~0U, 0);

@@ -1,3 +1,15 @@
+sandbox (2.3.5-1) unstable; urgency=high
+
+  * mount /proc with subset=pid,hidepid=2
+  * reset hostname/domainname in the new UTS namespace
+  * drop caller's supplementary groups before setuid
+  * pids cgroup controller, pids.max=1024
+  * seccomp: block unshare/clone CLONE_NEWUSER, clone3, setns,
+    io_uring_setup/enter/register, add_key, request_key, keyctl;
+    kill any syscall using the x32 ABI
+
+ -- Sergey Svistunov <sergey-svistunov@yandex.ru>  Fri, 15 May 2026 19:30:00 +0000
+
 sandbox (2.3.4-1) unstable; urgency=high
 
   * use clone3(CLONE_INTO_CGROUP) so the sandbox parent is NEVER placed in
