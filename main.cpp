@@ -1,3 +1,7 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <iostream>
 #include <fstream>
 #include <array>
@@ -9,6 +13,7 @@
 
 #include <filesystem>
 #include <unistd.h>
+#include <sched.h>          // unshare(2), CLONE_NEWNS
 #include <sys/wait.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
@@ -750,6 +755,24 @@ int main(int argc, char *argv[]) {
     sa.sa_flags = 0; // No SA_RESTART so waitpid gets EINTR
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
+
+    // Give the parent its OWN mount namespace before any --mount_dir bind (the
+    // arg loop below creates them). Binds then exist only in this private
+    // namespace and are torn down by the kernel the instant the process dies -
+    // including SIGKILL, which bypasses atexit()/clean(). This is the
+    // root-cause fix for the host /usr/lib wipe: even if the orchestrator
+    // SIGKILLs us (ctx cancel) mid-compile, the /usr/lib /lib /usr/libexec
+    // /usr/include binds never exist in the host namespace, so a later
+    // os.RemoveAll of the build dir cannot cross a leaked bind into the real
+    // host tree.
+    if (unshare(CLONE_NEWNS))
+        fatal_errno("cannot unshare mount namespace");
+
+    // MS_REC|MS_PRIVATE is load-bearing: the host '/' is MS_SHARED on systemd
+    // systems, so without this our binds would propagate back into the host's
+    // peer group and re-leak. Mirrors the child-side make-private at _execute().
+    if (mount("", "/", "", MS_REC | MS_PRIVATE, nullptr))
+        fatal_errno("cannot make mounts private in new namespace");
 
     init_dirs();
 

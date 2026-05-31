@@ -1,3 +1,10 @@
+sandbox (2.3.6-1) unstable; urgency=high
+
+  * parent unshares CLONE_NEWNS + MS_REC|MS_PRIVATE before --mount_dir binds,
+    so a SIGKILLed parent can't leak RW host binds (fixes /usr/lib wipe)
+
+ -- Sergey Svistunov <sergey-svistunov@yandex.ru>  Sun, 31 May 2026 08:03:27 +0000
+
 sandbox (2.3.5-1) unstable; urgency=high
 
   * mount /proc with subset=pid,hidepid=2
