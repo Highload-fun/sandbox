@@ -1,3 +1,9 @@
+sandbox (2.3.7-1) unstable; urgency=high
+
+  * report a signalled child as 128+signo instead of exit code 0
+
+ -- Sergey Svistunov <sergey-svistunov@yandex.ru>  Tue, 26 Aug 2026 16:40:00 +0000
+
 sandbox (2.3.6-1) unstable; urgency=high
 
   * parent unshares CLONE_NEWNS + MS_REC|MS_PRIVATE before --mount_dir binds,

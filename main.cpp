@@ -671,6 +671,9 @@ int execute(const fs::path &bin, const std::vector<char *> &args, const std::vec
     if (got_signal)
         return EXIT_FAILURE;
 
+    if (WIFSIGNALED(wstatus))
+        return 128 + WTERMSIG(wstatus);
+
     return WEXITSTATUS(wstatus);
 }
 
