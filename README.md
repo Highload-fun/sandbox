@@ -49,6 +49,7 @@ The `<sandbox_path>` is a temporary directory created by the tool to serve as th
 | `--cgroup <name>` | Run the process in a named cgroup |
 | `--cpuset <list>` | Restrict to specific CPUs (e.g. `0,1,2`) |
 | `--mem_limit <bytes>` | Set a memory limit (requires `--cgroup`) |
+| `--no_swap` | Forbid swap, so the memory limit is a hard limit (requires `--mem_limit`) |
 | `--save_usage_stat <file>` | Write CPU and memory usage stats after execution |
 | `--exec_dir <path>` | Working directory inside the sandbox (default: `/root`) |
 

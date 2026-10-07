@@ -622,6 +622,33 @@ test_pid_isolation() {
     assert_output_contains "$out" "Pid:.*1" "process sees itself as PID 1"
 }
 
+test_memory_limit_no_swap() {
+    echo "[memory limit without swap]"
+
+    # With swap forbidden, allocating 200MB under a 10MB limit is killed by OOM
+    local out rc=0
+    out=$(sbox memnoswap \
+        --add_file "$HELPERS_DIR/memhog" /bin/memhog \
+        --cgroup "sandbox_test_noswap_$$" \
+        --mem_limit 10485760 \
+        --no_swap \
+        -- /bin/memhog 200 2>&1) || rc=$?
+    assert_exit 137 $rc "200MB allocation killed by OOM with swap forbidden"
+    assert_output_not_contains "$out" "allocated 200MB" "no allocation output"
+}
+
+test_no_swap_requires_mem_limit() {
+    echo "[no_swap requires mem_limit]"
+
+    local out
+    out=$(sbox noswapnolimit \
+        --add_elf_file /bin/echo /bin/echo \
+        --cgroup "sandbox_test_noswapnl_$$" \
+        --no_swap \
+        -- /bin/echo test 2>&1) || true
+    assert_output_contains "$out" "without memory limit" "no_swap rejected without --mem_limit"
+}
+
 test_memlimit_requires_cgroup() {
     echo "[mem_limit requires cgroup]"
 
@@ -664,6 +691,8 @@ main() {
     test_network_isolation
     test_cgroup
     test_memory_limit
+    test_memory_limit_no_swap
+    test_no_swap_requires_mem_limit
     test_cpuset
     test_save_usage_stat
     test_sandbox_cleanup

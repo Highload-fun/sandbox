@@ -1,3 +1,9 @@
+sandbox (2.3.8-1) unstable; urgency=medium
+
+  * add --no_swap: set memory.swap.max=0 so --mem_limit is a hard limit
+
+ -- Sergey Svistunov <sergey-svistunov@yandex.ru>  Wed, 07 Oct 2026 12:00:00 +0000
+
 sandbox (2.3.7-1) unstable; urgency=high
 
   * report a signalled child as 128+signo instead of exit code 0
