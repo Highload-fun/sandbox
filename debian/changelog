@@ -1,3 +1,10 @@
+sandbox (2.3.9-1) unstable; urgency=medium
+
+  * add --oom_group: set memory.oom.group=1 so an OOM kill of any process
+    ends the whole sandbox, and a caller cannot miss a killed child
+
+ -- Sergey Svistunov <sergey-svistunov@yandex.ru>  Fri, 09 Oct 2026 07:30:00 +0000
+
 sandbox (2.3.8-1) unstable; urgency=medium
 
   * add --no_swap: set memory.swap.max=0 so --mem_limit is a hard limit

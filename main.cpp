@@ -390,7 +390,8 @@ void mount_dir(const fs::path &src, const fs::path &dst) {
             fatal_errno("cannot mount dir " + src.string());
 }
 
-cgroup *create_cgroup(const std::string &name, const std::string &cpu_set, uint64_t mem_limit, bool no_swap) {
+cgroup *create_cgroup(const std::string &name, const std::string &cpu_set, uint64_t mem_limit, bool no_swap,
+                      bool oom_group) {
     if (cgroup_init())
         fatal_cgroup("cannot init cgroup");
 
@@ -417,6 +418,9 @@ cgroup *create_cgroup(const std::string &name, const std::string &cpu_set, uint6
 
         if (no_swap && cgroup_set_value_string(mem_ctrl, "memory.swap.max", "0"))
             fatal_cgroup("cannot set memory.swap.max");
+
+        if (oom_group && cgroup_set_value_string(mem_ctrl, "memory.oom.group", "1"))
+            fatal_cgroup("cannot set memory.oom.group");
     }
 
     if (!cgroup_add_controller(cgroup, "io")) {
@@ -596,7 +600,7 @@ void save_usage_stat(const std::string &filename, const std::string &cgroup_name
 
 int execute(const fs::path &bin, const std::vector<char *> &args, const std::vector<char *> &env, const int flags,
             const std::string &cgroup_name, const std::string &cpu_set, const uint64_t mem_limit, const bool no_swap,
-            const std::string &usage_stat_file, const fs::path &exec_dir) {
+            const bool oom_group, const std::string &usage_stat_file, const fs::path &exec_dir) {
 
     if (mem_limit && cgroup_name.empty())
         fatal("cannot set memory limit without cgroup name");
@@ -604,11 +608,14 @@ int execute(const fs::path &bin, const std::vector<char *> &args, const std::vec
     if (no_swap && !mem_limit)
         fatal("cannot forbid swap without memory limit");
 
+    if (oom_group && !mem_limit)
+        fatal("cannot group OOM kills without memory limit");
+
     exe_opts opts{bin, args, env, exec_dir};
 
     int cgroup_fd = -1;
     if (!cgroup_name.empty()) {
-        sandbox_cgroup = create_cgroup(cgroup_name, cpu_set, mem_limit, no_swap);
+        sandbox_cgroup = create_cgroup(cgroup_name, cpu_set, mem_limit, no_swap, oom_group);
 
         // Open the cgroup directory as an fd so clone3(CLONE_INTO_CGROUP) can
         // place the child directly into it without the parent ever joining.
@@ -714,6 +721,9 @@ args:
     --no_swap
         Forbid swap for a process (requires --mem_limit)
 
+    --oom_group
+        Kill every process of the sandbox when the OOM killer kills one (requires --mem_limit)
+
     --save_usage_stat <filename>
         Save usage statistic to file after exit
 
@@ -796,6 +806,7 @@ int main(int argc, char *argv[]) {
     std::string cgroup, cpu_set, usage_stat_file;
     uint64_t mem_limit = 0;
     bool no_swap = false;
+    bool oom_group = false;
     std::vector<char *> cmd_args = {nullptr}; // reserved for cmd path
     std::vector<char *> cmd_env;
     int ignored_flags = 0;
@@ -870,6 +881,11 @@ int main(int argc, char *argv[]) {
 
             i++;
 
+        } else if (strcmp(argv[i], "--oom_group") == 0) {
+            oom_group = true;
+
+            i++;
+
         } else if (strcmp(argv[i], "--save_usage_stat") == 0) {
             if (i + 2 > argc || strncmp(argv[i + 1], "--", 2) == 0)
                 print_usage();
@@ -899,5 +915,6 @@ int main(int argc, char *argv[]) {
     cmd_args.push_back(nullptr);
     cmd_env.push_back(nullptr);
 
-    return execute(cmd, cmd_args, cmd_env, flags, cgroup, cpu_set, mem_limit, no_swap, usage_stat_file, exec_dir);
+    return execute(cmd, cmd_args, cmd_env, flags, cgroup, cpu_set, mem_limit, no_swap, oom_group, usage_stat_file,
+                   exec_dir);
 }

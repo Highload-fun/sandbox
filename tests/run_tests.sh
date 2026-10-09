@@ -111,6 +111,31 @@ int main(int argc, char **argv) {
 }
 C
 
+    # forkhog: forks a child that touches N megabytes, waits for it, and exits 0 whatever happened to it
+    cat > "$HELPERS_DIR/forkhog.c" << 'C'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    size_t mb = argc > 1 ? (size_t)atoi(argv[1]) : 50;
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); return 1; }
+    if (pid == 0) {
+        size_t sz = mb * 1024 * 1024;
+        char *p = malloc(sz);
+        if (!p) return 1;
+        memset(p, 'A', sz);
+        return 0;
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    printf("parent done\n");
+    return 0;
+}
+C
+
     # sleeper: sleeps, prints, exits
     cat > "$HELPERS_DIR/sleeper.c" << 'C'
 #include <stdio.h>
@@ -205,6 +230,7 @@ int main() {
 C
 
     gcc -static -o "$HELPERS_DIR/memhog"    "$HELPERS_DIR/memhog.c"
+    gcc -static -o "$HELPERS_DIR/forkhog"   "$HELPERS_DIR/forkhog.c"
     gcc -static -o "$HELPERS_DIR/sleeper"   "$HELPERS_DIR/sleeper.c"
     gcc -static -o "$HELPERS_DIR/writetest" "$HELPERS_DIR/writetest.c"
     gcc -static -o "$HELPERS_DIR/devcheck"  "$HELPERS_DIR/devcheck.c"
@@ -649,6 +675,44 @@ test_no_swap_requires_mem_limit() {
     assert_output_contains "$out" "without memory limit" "no_swap rejected without --mem_limit"
 }
 
+test_oom_group() {
+    echo "[oom group]"
+
+    # A child killed by OOM ends the whole sandbox, so the parent's exit 0 is not reported
+    local out rc=0
+    out=$(sbox oomgroup \
+        --add_file "$HELPERS_DIR/forkhog" /bin/forkhog \
+        --cgroup "sandbox_test_oomgroup_$$" \
+        --mem_limit 10485760 \
+        --no_swap \
+        --oom_group \
+        -- /bin/forkhog 200 2>&1) || rc=$?
+    assert_exit 137 $rc "an OOM kill of a child ends the sandbox"
+    assert_output_not_contains "$out" "parent done" "the parent was killed too"
+
+    # Without --oom_group only the child is killed, and the parent exits 0
+    rc=0
+    out=$(sbox oomchild \
+        --add_file "$HELPERS_DIR/forkhog" /bin/forkhog \
+        --cgroup "sandbox_test_oomchild_$$" \
+        --mem_limit 10485760 \
+        --no_swap \
+        -- /bin/forkhog 200 2>&1) || rc=$?
+    assert_exit 0 $rc "without --oom_group the parent survives its child"
+}
+
+test_oom_group_requires_mem_limit() {
+    echo "[oom_group requires mem_limit]"
+
+    local out
+    out=$(sbox oomgroupnolimit \
+        --add_elf_file /bin/echo /bin/echo \
+        --cgroup "sandbox_test_oomgroupnl_$$" \
+        --oom_group \
+        -- /bin/echo test 2>&1) || true
+    assert_output_contains "$out" "without memory limit" "oom_group rejected without --mem_limit"
+}
+
 test_memlimit_requires_cgroup() {
     echo "[mem_limit requires cgroup]"
 
@@ -693,6 +757,8 @@ main() {
     test_memory_limit
     test_memory_limit_no_swap
     test_no_swap_requires_mem_limit
+    test_oom_group
+    test_oom_group_requires_mem_limit
     test_cpuset
     test_save_usage_stat
     test_sandbox_cleanup
