@@ -128,6 +128,17 @@ assert_refused() {
     assert_output_contains "$out" "$pattern" "$name"
 }
 
+wait_for_path() {
+    # wait_for_path <path>: waits up to 5 s for the path to exist
+    local i
+    for i in $(seq 50); do
+        [ -e "$1" ] && return 0
+        sleep 0.1
+    done
+    fail "wait for $1" "timed out"
+    return 1
+}
+
 wait_for_output() {
     # wait_for_output <file> <pattern>: waits up to 5 s for the file to match pattern
     local i
@@ -298,6 +309,28 @@ int main() {
 }
 C
 
+    # deeptree: nests N folders named d in a folder, one level at a time, and exits 3
+    cat > "$HELPERS_DIR/deeptree.c" << 'C'
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    int n = argc > 2 ? atoi(argv[2]) : 0;
+    int fd = open(argv[1], O_RDONLY | O_DIRECTORY);
+    for (int i = 0; i < n; i++) {
+        if (mkdirat(fd, "d", 0755)) { perror("mkdirat"); return 1; }
+        int next = openat(fd, "d", O_RDONLY | O_DIRECTORY);
+        if (next < 0) { perror("openat"); return 1; }
+        close(fd);
+        fd = next;
+    }
+    printf("built %d\n", n);
+    return 3;
+}
+C
+
     gcc -static -o "$HELPERS_DIR/memhog"    "$HELPERS_DIR/memhog.c"
     gcc -static -o "$HELPERS_DIR/forkhog"   "$HELPERS_DIR/forkhog.c"
     gcc -static -o "$HELPERS_DIR/sleeper"   "$HELPERS_DIR/sleeper.c"
@@ -306,6 +339,7 @@ C
     gcc -static -o "$HELPERS_DIR/fdcheck"   "$HELPERS_DIR/fdcheck.c"
     gcc -static -o "$HELPERS_DIR/privcheck" "$HELPERS_DIR/privcheck.c"
     gcc -static -o "$HELPERS_DIR/stubborn"  "$HELPERS_DIR/stubborn.c"
+    gcc -static -o "$HELPERS_DIR/deeptree"  "$HELPERS_DIR/deeptree.c"
 }
 
 # ================================================================
@@ -841,6 +875,7 @@ test_uid_refused() {
     else
         echo "  SKIP: --uid in an /etc/subgid range (no /etc/subgid on this host)"
     fi
+    # The caller does not own CALLER_DIR, so this relies on check_uid running before the parent check
     assert_refused "--uid of the caller" "^--uid must not be the caller's UID or GID$" \
         caller_as 2000000400 uidself "${echo_args[@]}" --uid 2000000400 -- /bin/echo ran
     assert_refused "--uid for a root caller" "^--uid is refused for a root caller$" \
@@ -921,6 +956,10 @@ test_tmp_size() {
         --add_elf_file /bin/cat /bin/cat \
         -- /bin/cat /proc/self/mounts 2>&1) || true
     assert_output_not_contains "$out" " /tmp " "without --tmp_size /tmp is the on-disk folder"
+    out=$(sbox tmpdiskmode \
+        --add_elf_file /usr/bin/stat /usr/bin/stat \
+        -- /usr/bin/stat -c "%a %u" /tmp 2>&1) || true
+    assert_output_contains "$out" "^1777 0$" "the on-disk /tmp is sticky"
 
     local echo_args=(--add_elf_file /bin/echo /bin/echo)
     assert_refused "--tmp_size 0" "^--tmp_size must be a positive number of bytes$" \
@@ -1236,6 +1275,72 @@ test_mount_rules() {
         sbox mountroot "${echo_args[@]}" --mount_dir "$a" / -- /bin/echo ran
 }
 
+test_deep_tree() {
+    echo "[deep tree]"
+
+    # Far deeper than the removal walk's limit, deep enough to overflow a recursive walk's stack, and
+    # deeper than the 1024 descriptors a walk without the limit would need
+    local rc=0
+    (ulimit -n 1024; sbox deep \
+        --add_file "$HELPERS_DIR/deeptree" /bin/deeptree \
+        -- /bin/deeptree /tmp 50000) >/dev/null 2>&1 || rc=$?
+    assert_exit 3 $rc "the tool exits with the command's code"
+    if [ ! -e "$TEST_DIR/sbox_deep" ]; then
+        pass "a tree of 50000 levels is removed completely"
+    else
+        fail "a tree of 50000 levels is removed completely" "the sandbox is still there"
+    fi
+}
+
+test_link_during_placement() {
+    echo "[link planted while files are put in]"
+
+    if ! head -1 /usr/bin/ldd | grep -q bash; then
+        echo "  SKIP: /usr/bin/ldd is not a bash script, so BASH_ENV cannot hold the tool between two files"
+        return
+    fi
+
+    local host="$TEST_DIR/host_place" pause="$TEST_DIR/pause.fifo" hook="$TEST_DIR/pause.sh"
+    local leaf="$TEST_DIR/sbox_placement" out="$TEST_DIR/placement_out.txt" rc=0
+    mkdir -p "$host"
+    echo keep > "$host/keep"
+    mkfifo -m 600 "$pause"
+    # ldd, run for the first file, reads BASH_ENV and waits on the FIFO: the tree exists, the second file
+    # is still to come
+    printf 'read -r _ < %q\n' "$pause" > "$hook"
+    BASH_ENV="$hook" "$SANDBOX_BIN" "$leaf" \
+        --add_elf_file /bin/echo /bin/echo \
+        --add_file /etc/hostname /tmp/evil/pwned \
+        -- /bin/echo ran >"$out" 2>&1 &
+    local bg_pid=$!
+    wait_for_path "$leaf/tmp"
+    ln -s "$host" "$leaf/tmp/evil"
+    write_fifo "$pause" go
+    wait "$bg_pid" || rc=$?
+
+    assert_exit 1 $rc "a link planted in the tree fails the run"
+    assert_output_contains "$(cat "$out")" "a link, a file or a mount is in the way$" "the link is refused"
+    if [ -f "$host/keep" ] && [ ! -e "$host/pwned" ]; then
+        pass "nothing is written through it"
+    else
+        fail "nothing is written through it" "$host changed"
+    fi
+}
+
+test_foreign_setid_copied() {
+    echo "[someone else's set-ID file is copied]"
+
+    # On the same filesystem a link would keep root's set-ID inode alive in the sandbox
+    local src="$TEST_DIR/setid_root" out rc=0
+    install -o root -g root -m 4755 "$HELPERS_DIR/privcheck" "$src"
+    out=$(caller setidroot \
+        --add_elf_file /usr/bin/stat /usr/bin/stat \
+        --add_file "$src" /setid \
+        -- /usr/bin/stat -c "%a %u %h" /setid 2>&1) || rc=$?
+    assert_exit 0 $rc "stat runs on it"
+    assert_output_contains "$out" "^755 0 1$" "a root-owned set-ID file is copied without the bit, not linked"
+}
+
 test_copy_drops_setid() {
     echo "[copies drop set-ID bits]"
 
@@ -1323,6 +1428,9 @@ main() {
     test_sandbox_moved
     test_mount_rules
     test_copy_drops_setid
+    test_foreign_setid_copied
+    test_link_during_placement
+    test_deep_tree
 
     echo ""
     echo "=== Results ==="

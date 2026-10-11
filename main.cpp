@@ -24,7 +24,6 @@
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/mman.h>
-#include <sys/resource.h>
 #include <fcntl.h>
 #include <dirent.h>
 #include <grp.h>            // setgroups
@@ -78,6 +77,9 @@
 #define UID_RANGE_MAX 2000999999ULL
 #define DEFAULT_STOP_GRACE 30
 #define MAX_STOP_GRACE 3600
+// The removal walk keeps at most this many folders open; a deeper subtree is moved up
+#define MAX_WALK_DEPTH 256
+#define MAX_HOISTS 1000000UL
 
 static_assert(UID_RANGE_MIN > NOBODY_UID && UID_RANGE_MAX < UINT32_MAX, "--uid range");
 
@@ -399,47 +401,74 @@ static std::vector<std::string> list_dir(int dir_fd) {
     return names;
 }
 
-static void remove_entry(int dir_fd, const char *name);
+// Removes everything in the folder top_fd, without recursion. It never follows a link and never enters a
+// mount: a mount inside is detached, and the folder under it removed. At most MAX_WALK_DEPTH folders are
+// open at a time: a subtree deeper than that is moved up into top_fd, on the same mount, and removed from
+// there in its turn, so any depth is removed.
+static void empty_tree(int top_fd) {
+    struct frame {
+        int fd;
+        std::vector<std::string> names;
+        size_t next;
+        unsigned long rounds;
+    };
+    int top = fcntl(top_fd, F_DUPFD_CLOEXEC, 0);
+    if (top < 0)
+        fatal_errno("cannot remove sandbox");
+    std::vector<frame> stack;
+    stack.push_back({top, {}, 0, 0});
+    unsigned long hoisted = 0;
 
-// Removes everything in the folder dir_fd. It never follows a link and never enters a mount: a mount
-// inside is detached, and the folder under it removed.
-static void empty_tree(int dir_fd) {
-    for (int round = 0; round < 3; round++) {
-        auto names = list_dir(dir_fd);
-        if (names.empty())
-            return;
-        for (const auto &name: names)
-            remove_entry(dir_fd, name.c_str());
-    }
-    fatal("cannot remove sandbox: its folders keep changing");
-}
+    while (!stack.empty()) {
+        frame &f = stack.back();
+        if (f.next == f.names.size()) {
+            f.names = list_dir(f.fd);
+            f.next = 0;
+            if (f.names.empty()) {
+                close(f.fd);
+                stack.pop_back();
+                // An entry added meanwhile keeps the folder for the parent's next listing
+                if (!stack.empty() &&
+                    unlinkat(stack.back().fd, stack.back().names[stack.back().next - 1].c_str(), AT_REMOVEDIR) &&
+                    errno != ENOENT && errno != ENOTEMPTY && errno != EEXIST)
+                    fatal_errno("cannot remove sandbox");
+                continue;
+            }
+            // Every subtree moved up into top_fd costs it one more listing
+            if (++f.rounds > 3 + (stack.size() == 1 ? hoisted : 0))
+                fatal("cannot remove sandbox: its folders keep changing");
+        }
 
-static void remove_entry(int dir_fd, const char *name) {
-    for (int i = 0; i < 100; i++) {
-        if (unlinkat(dir_fd, name, 0) == 0 || errno == ENOENT)
-            return;
+        // What fails here and changes meanwhile shows up again in the folder's next listing
+        const char *name = f.names[f.next++].c_str();
+        if (unlinkat(f.fd, name, 0) == 0 || errno == ENOENT)
+            continue;
         if (errno == EBUSY) {
-            detach_mount(dir_fd, name);
+            detach_mount(f.fd, name);
             continue;
         }
         if (errno != EISDIR)
             fatal_errno("cannot remove sandbox");
 
-        int fd = open_dir_detaching(dir_fd, name);
-        if (fd < 0) {
-            // The entry changed between the two calls: look at it again
-            if (errno == ENOENT || errno == ENOTDIR || errno == ELOOP)
-                continue;
-            fatal_errno("cannot remove sandbox");
+        if (stack.size() >= MAX_WALK_DEPTH) {
+            for (;;) {
+                if (++hoisted > MAX_HOISTS)
+                    fatal("cannot remove sandbox: its folders keep changing");
+                auto moved = ".sandbox-deep-" + std::to_string(hoisted);
+                if (renameat2(f.fd, name, stack.front().fd, moved.c_str(), RENAME_NOREPLACE) == 0 || errno == ENOENT)
+                    break;
+                if (errno != EEXIST)
+                    fatal_errno("cannot remove sandbox");
+            }
+            continue;
         }
-        empty_tree(fd);
-        close(fd);
-        if (unlinkat(dir_fd, name, AT_REMOVEDIR) == 0 || errno == ENOENT)
-            return;
-        if (errno != ENOTEMPTY && errno != EEXIST)
+
+        int fd = open_dir_detaching(f.fd, name);
+        if (fd >= 0)
+            stack.push_back({fd, {}, 0, 0});
+        else if (errno != ENOENT && errno != ENOTDIR && errno != ELOOP)
             fatal_errno("cannot remove sandbox");
     }
-    fatal("cannot remove sandbox: its folders keep changing");
 }
 
 // Removes the sandbox folder from its parent, unless the name no longer leads to it
@@ -558,13 +587,6 @@ void make_sandbox() {
 void remove_sandbox() {
     if (sandbox_fd < 0)
         return;
-
-    // A deep tree needs a descriptor per level
-    struct rlimit nofile;
-    if (getrlimit(RLIMIT_NOFILE, &nofile) == 0) {
-        nofile.rlim_cur = nofile.rlim_max;
-        setrlimit(RLIMIT_NOFILE, &nofile);
-    }
 
     struct stat st;
     if (fstat(sandbox_fd, &st))
@@ -740,8 +762,12 @@ static void place_file(const std::string &src, const fs::path &dst) {
         fatal("add_file destination must name a file: " + dst.string());
     int dir_fd = open_beneath(dst.parent_path().relative_path(), true);
 
+    // Someone else's set-ID file is copied for a non-root caller, so no new link keeps its inode alive
     auto src_link = "/proc/self/fd/" + std::to_string(src_fd);
-    if (linkat(AT_FDCWD, src_link.c_str(), dir_fd, name.c_str(), AT_SYMLINK_FOLLOW) && errno != EEXIST) {
+    bool foreign_setid = caller_uid != 0 && st.st_uid != caller_uid && (st.st_mode & (S_ISUID | S_ISGID));
+    if (foreign_setid) {
+        copy_file_into(src_link, st, dir_fd, name);
+    } else if (linkat(AT_FDCWD, src_link.c_str(), dir_fd, name.c_str(), AT_SYMLINK_FOLLOW) && errno != EEXIST) {
         if (errno != EXDEV)
             fatal_errno("cannot create hardlink " + src + "->" + dst.string());
         copy_file_into(src_link, st, dir_fd, name);
@@ -1081,9 +1107,10 @@ int execute(const fs::path &bin, const std::vector<char *> &args, const std::vec
     if (tmp_size)
         tmp_mount_opts = "size=" + std::to_string(tmp_size) + ",mode=1777";
 
-    // Everything is in place: only now may others write /tmp, which stays 0755 under a tmpfs
-    if (!tmp_size && fchmod(tmp_fd, 0777))
-        fatal_errno("cannot set mode 777 for /tmp");
+    // Everything is in place: only now may others write /tmp, sticky so they cannot move or remove what
+    // they do not own; it stays 0755 under a tmpfs
+    if (!tmp_size && fchmod(tmp_fd, 01777))
+        fatal_errno("cannot set mode 1777 for /tmp");
     close(tmp_fd);
     tmp_fd = -1;
 

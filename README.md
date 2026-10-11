@@ -41,7 +41,7 @@ The `<sandbox_path>` is a temporary directory created by the tool to serve as th
 
 | Option | Description |
 |---|---|
-| `--add_file <src> <dst>` | Put a regular file from the host into the sandbox: a hard link, or a copy without set-ID bits across filesystems |
+| `--add_file <src> <dst>` | Put a regular file from the host into the sandbox: a hard link, or a copy without set-ID bits across filesystems or when a non-root caller adds someone else's set-ID file |
 | `--add_elf_file <src> <dst>` | Copy an ELF binary and its shared library dependencies |
 | `--mount_dir <src> <dst>` | Bind-mount a host directory into the sandbox, not under another mount and not at its root |
 | `--env <value>` | Set an environment variable (e.g. `--env PATH=/usr/bin`) |
@@ -96,7 +96,7 @@ The sandbox path's parent must be the caller's own folder, or a root-owned stick
 
 A folder already at the sandbox path, left by an earlier run, is removed first. It must be the caller's, or root's in the caller's own parent; in a shared parent such as `/tmp` a root-owned folder may be anyone's, so the tool refuses it. A link at the sandbox path is refused.
 
-The tool builds and removes the tree through file descriptors, never by its path: it follows no link inside the tree, enters no mount when it removes it, and a rename of the folder during a run redirects nothing. `/tmp` in the tree becomes writable by others only once everything is in place. `ldd` runs as the caller, on the host's file.
+The tool builds and removes the tree through file descriptors, never by its path: it follows no link inside the tree, enters no mount when it removes it, and a rename of the folder during a run redirects nothing. `/tmp` in the tree becomes writable by others, sticky (1777), only once everything is in place. The removal walks the tree without recursion and keeps a bounded number of folders open, moving a deeper subtree up as it goes, so a tree of any depth is removed. `ldd` runs as the caller, on the host's file.
 
 ## Own UID
 
