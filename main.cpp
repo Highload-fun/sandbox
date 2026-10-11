@@ -8,11 +8,15 @@
 #include <vector>
 #include <string>
 #include <regex>
+#include <chrono>
+#include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 
 #include <filesystem>
 #include <unistd.h>
+#include <poll.h>
 #include <sched.h>          // unshare(2), CLONE_NEWNS
 #include <sys/wait.h>
 #include <sys/mount.h>
@@ -40,8 +44,19 @@
 #endif
 
 
+#ifndef SANDBOX_VERSION
+#error "SANDBOX_VERSION comes from CMakeLists.txt"
+#endif
+
 #define STACK_SIZE (1024 * 1024)
 #define NOBODY_UID 65534
+// --uid takes only IDs of this range
+#define UID_RANGE_MIN 2000000000ULL
+#define UID_RANGE_MAX 2000999999ULL
+#define DEFAULT_STOP_GRACE 30
+#define MAX_STOP_GRACE 3600
+
+static_assert(UID_RANGE_MIN > NOBODY_UID && UID_RANGE_MAX < UINT32_MAX, "--uid range");
 
 namespace fs = std::filesystem;
 
@@ -50,9 +65,15 @@ struct exe_opts {
     const std::vector<char *> &args;
     const std::vector<char *> &env;
     const fs::path &exec_dir;
+    const uid_t uid;
+    const std::string &tmp_mount_opts;
 };
 
 static volatile sig_atomic_t got_signal = 0;
+// Seconds between SIGTERM and SIGKILL on a stop; 0 makes SIGTERM/SIGINT to the tool kill the child at once
+static volatile sig_atomic_t stop_grace = 0;
+// Write end of the pipe that wakes the wait for the child
+static volatile sig_atomic_t wake_fd = -1;
 static pid_t pid;
 static fs::path sandbox = {};
 static cgroup *sandbox_cgroup = nullptr;
@@ -151,6 +172,151 @@ void validate_cgroup_name(const std::string &name) {
         fatal("cgroup name must not contain '/' or '..'");
     if (name[0] == '.')
         fatal("cgroup name must not start with '.'");
+}
+
+// Parses a command-line number: decimal digits only, no sign or spaces
+static bool parse_number(const std::string &s, uint64_t &out) {
+    if (s.empty() || s.size() > 19 || s.find_first_not_of("0123456789") != std::string::npos)
+        return false;
+    out = std::stoull(s);
+    return true;
+}
+
+static std::vector<std::string> split_fields(const std::string &line) {
+    std::vector<std::string> fields;
+    size_t start = 0;
+    for (;;) {
+        auto end = line.find(':', start);
+        fields.push_back(line.substr(start, end - start));
+        if (end == std::string::npos)
+            return fields;
+        start = end + 1;
+    }
+}
+
+// Reads a system file that --uid depends on; a missing file has no lines when missing_ok
+static std::vector<std::string> read_lines(const char *path, bool missing_ok) {
+    std::vector<std::string> lines;
+    struct stat st;
+    if (missing_ok && stat(path, &st) && errno == ENOENT)
+        return lines;
+
+    std::ifstream in(path);
+    if (!in.is_open())
+        fatal(std::string("--uid refused: cannot read ") + path);
+    for (std::string line; std::getline(in, line);)
+        lines.push_back(line);
+    if (in.bad())
+        fatal(std::string("--uid refused: cannot read ") + path);
+    return lines;
+}
+
+// Reports whether a passwd or group line has id in a field at one of indexes. A field is read as glibc
+// reads it (strtoul, clamped to 32 bits), so a line that glibc skips matches nothing.
+static bool has_id_entry(const char *path, std::initializer_list<size_t> indexes, uint64_t id) {
+    for (const auto &line: read_lines(path, false)) {
+        auto fields = split_fields(line);
+        for (auto index: indexes) {
+            if (index >= fields.size() || fields[index].empty())
+                continue;
+            const char *field = fields[index].c_str();
+            char *end;
+            unsigned long long value = strtoull(field, &end, 10);
+            if (end != field && *end == '\0' && std::min<unsigned long long>(value, UINT32_MAX) == id)
+                return true;
+        }
+    }
+    return false;
+}
+
+// Reports whether id lies in a range of /etc/subuid or /etc/subgid; a line it cannot parse refuses --uid
+static bool in_subid_range(const char *path, uint64_t id) {
+    for (const auto &line: read_lines(path, true)) {
+        if (line.empty() || line[0] == '#')
+            continue;
+        auto fields = split_fields(line);
+        uint64_t start, count;
+        if (fields.size() != 3 || !parse_number(fields[1], start) || !parse_number(fields[2], count))
+            fatal(std::string("--uid refused: cannot parse ") + path);
+        if (id >= start && id - start < count)
+            return true;
+    }
+    return false;
+}
+
+// Checks --uid: a caller other than root, and an ID of the reserved range that is not the caller's and
+// that no account, group or subordinate range uses. Every refusal is a fixed message and exit 1.
+uid_t check_uid(const char *value) {
+    if (caller_uid == 0)
+        fatal("--uid is refused for a root caller");
+
+    uint64_t id;
+    if (!parse_number(value, id) || id < UID_RANGE_MIN || id > UID_RANGE_MAX)
+        fatal("--uid must be in the range " + std::to_string(UID_RANGE_MIN) + "-" + std::to_string(UID_RANGE_MAX));
+
+    if (id == caller_uid || id == caller_gid)
+        fatal("--uid must not be the caller's UID or GID");
+
+    if (has_id_entry("/etc/passwd", {2, 3}, id))
+        fatal("--uid has an /etc/passwd entry");
+
+    if (has_id_entry("/etc/group", {2}, id))
+        fatal("--uid has an /etc/group entry");
+
+    if (in_subid_range("/etc/subuid", id) || in_subid_range("/etc/subgid", id))
+        fatal("--uid lies in an /etc/subuid or /etc/subgid range");
+
+    return static_cast<uid_t>(id);
+}
+
+// Returns --cpu_max, "<quota_us> <period_us>", as cpu.max reads back; the kernel checks the bounds
+std::string parse_cpu_max(const std::string &value) {
+    auto space = value.find(' ');
+    uint64_t quota, period;
+    if (space == std::string::npos || !parse_number(value.substr(0, space), quota) ||
+        !parse_number(value.substr(space + 1), period))
+        fatal("--cpu_max must be \"<quota_us> <period_us>\"");
+    return std::to_string(quota) + " " + std::to_string(period);
+}
+
+// Opens the stop FIFO with the caller's rights and accepts only a FIFO that the caller owns and that
+// neither its group nor others may write to. The checks are on the open fd, never the path.
+int open_stop_fifo(const char *path) {
+    if (setegid(caller_gid))
+        fatal_errno("cannot drop privileges for --stop_fifo");
+    if (seteuid(caller_uid))
+        fatal_errno("cannot drop privileges for --stop_fifo");
+
+    int fd = open(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+    int open_errno = errno;
+
+    if (seteuid(0))
+        fatal_errno("cannot restore privileges");
+    if (setegid(0))
+        fatal_errno("cannot restore privileges");
+
+    if (fd < 0) {
+        errno = open_errno;
+        fatal_errno("cannot open --stop_fifo");
+    }
+
+    struct stat st;
+    if (fstat(fd, &st))
+        fatal_errno("cannot stat --stop_fifo");
+    if (!S_ISFIFO(st.st_mode))
+        fatal("--stop_fifo is not a FIFO");
+    if (st.st_uid != caller_uid)
+        fatal("--stop_fifo is not owned by the caller");
+    if (st.st_mode & (S_IWGRP | S_IWOTH))
+        fatal("--stop_fifo is writable by its group or others");
+
+    // Hold a write end of the same FIFO, so a writer that closes is never seen as EOF or POLLHUP. It stays
+    // open until the tool exits.
+    auto same_fifo = "/proc/self/fd/" + std::to_string(fd);
+    if (open(same_fifo.c_str(), O_WRONLY | O_NONBLOCK | O_CLOEXEC) < 0)
+        fatal_errno("cannot hold --stop_fifo open");
+
+    return fd;
 }
 
 void path_pids(std::vector<int> &res) {
@@ -390,8 +556,8 @@ void mount_dir(const fs::path &src, const fs::path &dst) {
             fatal_errno("cannot mount dir " + src.string());
 }
 
-cgroup *create_cgroup(const std::string &name, const std::string &cpu_set, uint64_t mem_limit, bool no_swap,
-                      bool oom_group) {
+cgroup *create_cgroup(const std::string &name, const std::string &cpu_set, const std::string &cpu_max,
+                      uint64_t mem_limit, bool no_swap, bool oom_group) {
     if (cgroup_init())
         fatal_cgroup("cannot init cgroup");
 
@@ -401,6 +567,9 @@ cgroup *create_cgroup(const std::string &name, const std::string &cpu_set, uint6
     if (!cpu_ctrl) {
         fatal_cgroup("cannot cpu controller");
     }
+
+    if (!cpu_max.empty() && cgroup_set_value_string(cpu_ctrl, "cpu.max", cpu_max.c_str()))
+        fatal_cgroup("cannot set cpu.max");
 
     if (!cpu_set.empty()) {
         if (cgroup_set_value_string(cpu_ctrl, "cpuset.cpus", cpu_set.c_str()))
@@ -521,6 +690,10 @@ static int _execute(void *arg) {
         if (errno != EBUSY)
             fatal_errno("cannot mount /proc");
 
+    if (!opts->tmp_mount_opts.empty() &&
+        mount("tmpfs", "/tmp", "tmpfs", MS_NOSUID | MS_NODEV, opts->tmp_mount_opts.c_str()))
+        fatal_errno("cannot mount /tmp");
+
     if (chdir(opts->exec_dir.empty() ? "/root" : opts->exec_dir.c_str()))
         fatal_errno("cannot chdir");
 
@@ -534,11 +707,19 @@ static int _execute(void *arg) {
     if (setgroups(0, nullptr))
         fatal_errno("cannot drop supplementary groups");
 
-    if (setgid(NOBODY_UID))
+    if (setgid(opts->uid))
         fatal_errno("cannot set GID");
 
-    if (setuid(NOBODY_UID))
+    if (setuid(opts->uid))
         fatal_errno("cannot set UID");
+
+    // Fail closed unless every UID and GID is the sandbox's and no supplementary group is left
+    uid_t ruid, euid, suid;
+    gid_t rgid, egid, sgid;
+    if (getresuid(&ruid, &euid, &suid) || getresgid(&rgid, &egid, &sgid) || getgroups(0, nullptr) != 0 ||
+        ruid != opts->uid || euid != opts->uid || suid != opts->uid ||
+        rgid != opts->uid || egid != opts->uid || sgid != opts->uid)
+        fatal("cannot verify the dropped UID and GID");
 
     // Prevent privilege escalation via SUID binaries (fix: missing CLONE_NEWUSER)
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))
@@ -598,9 +779,70 @@ void save_usage_stat(const std::string &filename, const std::string &cgroup_name
     }
 }
 
+// Async-signal-safe: wakes the wait for the child
+void wake(int) {
+    int saved_errno = errno;
+    if (wake_fd >= 0) {
+        [[maybe_unused]] ssize_t n = write(wake_fd, "", 1);
+    }
+    errno = saved_errno;
+}
+
+// Waits for the child and returns its wait status. A stop - a byte read from the stop FIFO, or SIGTERM or
+// SIGINT to the tool - sends the child SIGTERM, then SIGKILL once the grace has passed. Without a grace,
+// SIGTERM or SIGINT kills the child at once.
+int wait_child(int wake_read_fd, int stop_fifo) {
+    using clock = std::chrono::steady_clock;
+    bool stop_requested = false, stopping = false, killed = false;
+    clock::time_point deadline;
+
+    for (;;) {
+        int wstatus;
+        pid_t r = waitpid(pid, &wstatus, WNOHANG);
+        if (r == pid)
+            return wstatus;
+        if (r == -1 && errno != EINTR)
+            fatal_errno("waitpid failed");
+
+        if ((got_signal || stop_requested) && !stopping) {
+            stopping = true;
+            if (stop_grace) {
+                kill(pid, SIGTERM);
+                deadline = clock::now() + std::chrono::seconds(stop_grace);
+            } else {
+                kill(pid, SIGKILL);
+                killed = true;
+            }
+        }
+
+        int timeout = -1;
+        if (stopping && !killed) {
+            auto left = std::chrono::ceil<std::chrono::milliseconds>(deadline - clock::now()).count();
+            if (left > 0) {
+                timeout = static_cast<int>(left);
+            } else {
+                kill(pid, SIGKILL);
+                killed = true;
+            }
+        }
+
+        struct pollfd fds[2] = {{wake_read_fd, POLLIN, 0}, {stop_fifo, POLLIN, 0}};
+        nfds_t nfds = stop_fifo >= 0 && !stopping ? 2 : 1;
+        if (poll(fds, nfds, timeout) == -1 && errno != EINTR)
+            fatal_errno("poll failed");
+
+        char buf[64];
+        while (read(wake_read_fd, buf, sizeof(buf)) > 0) {
+        }
+        if (nfds == 2 && (fds[1].revents & POLLIN) && read(stop_fifo, buf, sizeof(buf)) > 0)
+            stop_requested = true;
+    }
+}
+
 int execute(const fs::path &bin, const std::vector<char *> &args, const std::vector<char *> &env, const int flags,
-            const std::string &cgroup_name, const std::string &cpu_set, const uint64_t mem_limit, const bool no_swap,
-            const bool oom_group, const std::string &usage_stat_file, const fs::path &exec_dir) {
+            const std::string &cgroup_name, const std::string &cpu_set, const std::string &cpu_max,
+            const uint64_t mem_limit, const bool no_swap, const bool oom_group, const std::string &usage_stat_file,
+            const fs::path &exec_dir, const uid_t uid, const uint64_t tmp_size, const int stop_fifo) {
 
     if (mem_limit && cgroup_name.empty())
         fatal("cannot set memory limit without cgroup name");
@@ -611,11 +853,25 @@ int execute(const fs::path &bin, const std::vector<char *> &args, const std::vec
     if (oom_group && !mem_limit)
         fatal("cannot group OOM kills without memory limit");
 
-    exe_opts opts{bin, args, env, exec_dir};
+    if (!cpu_max.empty() && cgroup_name.empty())
+        fatal("cannot set cpu.max without cgroup name");
+
+    std::string tmp_mount_opts;
+    if (tmp_size)
+        tmp_mount_opts = "size=" + std::to_string(tmp_size) + ",mode=1777";
+
+    exe_opts opts{bin, args, env, exec_dir, uid, tmp_mount_opts};
 
     int cgroup_fd = -1;
     if (!cgroup_name.empty()) {
-        sandbox_cgroup = create_cgroup(cgroup_name, cpu_set, mem_limit, no_swap, oom_group);
+        sandbox_cgroup = create_cgroup(cgroup_name, cpu_set, cpu_max, mem_limit, no_swap, oom_group);
+
+        if (!cpu_max.empty()) {
+            std::ifstream in(fs::path("/sys/fs/cgroup") / cgroup_name / "cpu.max");
+            std::string written;
+            if (!std::getline(in, written) || written != cpu_max)
+                fatal("cannot set cpu.max");
+        }
 
         // Open the cgroup directory as an fd so clone3(CLONE_INTO_CGROUP) can
         // place the child directly into it without the parent ever joining.
@@ -636,6 +892,19 @@ int execute(const fs::path &bin, const std::vector<char *> &args, const std::vec
 
     // Create minimal device nodes before clone (fix: devtmpfs exposes all devices)
     create_dev_nodes();
+
+    // SIGCHLD wakes the wait for the child through a pipe, so no exit is missed between checks
+    int wake_pipe[2];
+    if (pipe2(wake_pipe, O_CLOEXEC | O_NONBLOCK))
+        fatal_errno("cannot create pipe");
+    wake_fd = wake_pipe[1];
+
+    struct sigaction sa = {};
+    sa.sa_handler = wake;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    if (sigaction(SIGCHLD, &sa, nullptr))
+        fatal_errno("cannot handle SIGCHLD");
 
     // clone3() handles fork-style child stack via COW; no need for explicit
     // mmap'd stack like clone() required.
@@ -668,20 +937,14 @@ int execute(const fs::path &bin, const std::vector<char *> &args, const std::vec
             fatal_errno("cannot chown cgroup.kill");
     }
 
-    // Handle EINTR from signal handler (fix: signal handler race condition)
-    int wstatus;
-    while (waitpid(pid, &wstatus, 0) == -1) {
-        if (errno == EINTR)
-            continue;
-        fatal_errno("waitpid failed");
-    }
+    int wstatus = wait_child(wake_pipe[0], stop_fifo);
 
     if (!usage_stat_file.empty())
         save_usage_stat(usage_stat_file, cgroup_name);
 
     clean();
 
-    if (got_signal)
+    if (got_signal && !stop_grace)
         return EXIT_FAILURE;
 
     if (WIFSIGNALED(wstatus))
@@ -729,6 +992,27 @@ args:
 
     --exec_dir <path>
         The directory inside a sandbox where the command will be executed
+
+    --uid <uid>
+        Run the command under this UID and GID instead of 65534: one of 2000000000-2000999999 that is not
+        the caller's and has no passwd, group, subuid or subgid entry; refused for a root caller
+
+    --cpu_max "<quota_us> <period_us>"
+        Write cpu.max of the cgroup (requires --cgroup)
+
+    --tmp_size <bytes>
+        Mount a nosuid,nodev tmpfs of this size at /tmp
+
+    --stop_fifo <path>
+        Stop the command when a byte is read from this FIFO, which the caller makes and owns and which its
+        group and others cannot write; EOF does not stop
+
+    --stop_grace <seconds>
+        Stop with SIGTERM, then SIGKILL after this many seconds (1-3600, default 30 with --stop_fifo);
+        SIGTERM and SIGINT to sandbox stop the same way
+
+    --version
+        Print the version
 )" << std::endl;
 
     exit(EXIT_FAILURE);
@@ -737,11 +1021,17 @@ args:
 // Async-signal-safe handler (fix: signal handler race condition)
 void signalHandler(int signum) {
     got_signal = signum;
-    if (pid > 0)
+    if (pid > 0 && !stop_grace)
         kill(pid, SIGKILL);
+    wake(signum);
 }
 
 int main(int argc, char *argv[]) {
+    if (argc == 2 && strcmp(argv[1], "--version") == 0) {
+        std::cout << SANDBOX_VERSION << std::endl;
+        return EXIT_SUCCESS;
+    }
+
     if (getuid() != 0 && geteuid() != 0)
         fatal("required root privileges");
 
@@ -803,8 +1093,11 @@ int main(int argc, char *argv[]) {
         fatal_errno("cannot open sandbox path");
 
     fs::path cmd, exec_dir;
-    std::string cgroup, cpu_set, usage_stat_file;
+    std::string cgroup, cpu_set, cpu_max, usage_stat_file;
     uint64_t mem_limit = 0;
+    uint64_t tmp_size = 0;
+    uid_t uid = NOBODY_UID;
+    int stop_fifo = -1;
     bool no_swap = false;
     bool oom_group = false;
     std::vector<char *> cmd_args = {nullptr}; // reserved for cmd path
@@ -902,10 +1195,60 @@ int main(int argc, char *argv[]) {
 
             i += 2;
 
+        } else if (strcmp(argv[i], "--uid") == 0) {
+            if (i + 2 > argc || strncmp(argv[i + 1], "--", 2) == 0)
+                print_usage();
+
+            uid = check_uid(argv[i + 1]);
+
+            i += 2;
+
+        } else if (strcmp(argv[i], "--cpu_max") == 0) {
+            if (i + 2 > argc || strncmp(argv[i + 1], "--", 2) == 0)
+                print_usage();
+
+            cpu_max = parse_cpu_max(argv[i + 1]);
+
+            i += 2;
+
+        } else if (strcmp(argv[i], "--tmp_size") == 0) {
+            if (i + 2 > argc || strncmp(argv[i + 1], "--", 2) == 0)
+                print_usage();
+
+            // tmpfs takes size=0 as no limit
+            if (!parse_number(argv[i + 1], tmp_size) || tmp_size == 0)
+                fatal("--tmp_size must be a positive number of bytes");
+
+            i += 2;
+
+        } else if (strcmp(argv[i], "--stop_fifo") == 0) {
+            if (i + 2 > argc || strncmp(argv[i + 1], "--", 2) == 0)
+                print_usage();
+
+            if (stop_fifo >= 0)
+                fatal("--stop_fifo is given twice");
+            stop_fifo = open_stop_fifo(argv[i + 1]);
+
+            i += 2;
+
+        } else if (strcmp(argv[i], "--stop_grace") == 0) {
+            if (i + 2 > argc || strncmp(argv[i + 1], "--", 2) == 0)
+                print_usage();
+
+            uint64_t grace;
+            if (!parse_number(argv[i + 1], grace) || grace < 1 || grace > MAX_STOP_GRACE)
+                fatal("--stop_grace must be 1-" + std::to_string(MAX_STOP_GRACE) + " seconds");
+            stop_grace = static_cast<sig_atomic_t>(grace);
+
+            i += 2;
+
         } else {
             print_usage();
         }
     }
+
+    if (stop_fifo >= 0 && !stop_grace)
+        stop_grace = DEFAULT_STOP_GRACE;
 
     int flags = CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWPID | CLONE_NEWCGROUP | SIGCHLD;
     if ((ignored_flags & CLONE_NEWNET) == 0)
@@ -915,6 +1258,6 @@ int main(int argc, char *argv[]) {
     cmd_args.push_back(nullptr);
     cmd_env.push_back(nullptr);
 
-    return execute(cmd, cmd_args, cmd_env, flags, cgroup, cpu_set, mem_limit, no_swap, oom_group, usage_stat_file,
-                   exec_dir);
+    return execute(cmd, cmd_args, cmd_env, flags, cgroup, cpu_set, cpu_max, mem_limit, no_swap, oom_group,
+                   usage_stat_file, exec_dir, uid, tmp_size, stop_fifo);
 }

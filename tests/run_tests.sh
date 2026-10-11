@@ -12,6 +12,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEST_DIR="/tmp/sandbox_tests_$$"
 HELPERS_DIR="$TEST_DIR/helpers"
+# A non-root caller for the flags that refuse root; it runs a setuid copy of the binary in TEST_DIR
+CALLER_UID=65533
+CALLER_BIN="$TEST_DIR/sandbox"
 PASSED=0
 FAILED=0
 ERRORS=()
@@ -87,6 +90,50 @@ sbox() {
     # Run sandbox with a unique directory under TEST_DIR
     local tag="$1"; shift
     "$SANDBOX_BIN" "$TEST_DIR/sbox_$tag" "$@"
+}
+
+caller_as() {
+    # Like sbox, as a non-root caller
+    local uid="$1" tag="$2"; shift 2
+    setpriv --reuid="$uid" --regid="$uid" --clear-groups "$CALLER_BIN" "$TEST_DIR/sbox_$tag" "$@"
+}
+
+caller() {
+    caller_as "$CALLER_UID" "$@"
+}
+
+caller_with_etc_line() {
+    # Like caller, with one more line in an /etc file that only this run sees
+    local file="$1" line="$2" tag="$3"; shift 3
+    local fake="$TEST_DIR/etc_$tag"
+    { cat "$file"; echo "$line"; } > "$fake"
+    unshare -m sh -c 'mount --bind "$1" "$2" && shift 2 && exec "$@"' sh "$fake" "$file" \
+        setpriv --reuid="$CALLER_UID" --regid="$CALLER_UID" --clear-groups "$CALLER_BIN" "$TEST_DIR/sbox_$tag" "$@"
+}
+
+assert_refused() {
+    # assert_refused <name> <pattern> <command...>: the command exits 1 with a message matching pattern
+    local name="$1" pattern="$2"; shift 2
+    local out rc=0
+    out=$("$@" 2>&1) || rc=$?
+    assert_exit 1 $rc "$name: exit 1"
+    assert_output_contains "$out" "$pattern" "$name"
+}
+
+wait_for_output() {
+    # wait_for_output <file> <pattern>: waits up to 5 s for the file to match pattern
+    local i
+    for i in $(seq 50); do
+        grep -qE "$2" "$1" 2>/dev/null && return 0
+        sleep 0.1
+    done
+    fail "wait for /$2/ in $(basename "$1")" "timed out"
+    return 1
+}
+
+write_fifo() {
+    # write_fifo <fifo> [<bytes>]: writes the bytes, or only opens and closes the FIFO; gives up after 5 s
+    timeout 5 sh -c 'printf "$2" > "$1"' sh "$1" "${2:-}"
 }
 
 # ---------- build helper binaries ----------
@@ -229,6 +276,20 @@ int main() {
 }
 C
 
+    # stubborn: ignores SIGTERM, says it is ready and sleeps
+    cat > "$HELPERS_DIR/stubborn.c" << 'C'
+#include <stdio.h>
+#include <unistd.h>
+#include <signal.h>
+int main() {
+    signal(SIGTERM, SIG_IGN);
+    printf("ready\n");
+    fflush(stdout);
+    sleep(60);
+    return 0;
+}
+C
+
     gcc -static -o "$HELPERS_DIR/memhog"    "$HELPERS_DIR/memhog.c"
     gcc -static -o "$HELPERS_DIR/forkhog"   "$HELPERS_DIR/forkhog.c"
     gcc -static -o "$HELPERS_DIR/sleeper"   "$HELPERS_DIR/sleeper.c"
@@ -236,6 +297,7 @@ C
     gcc -static -o "$HELPERS_DIR/devcheck"  "$HELPERS_DIR/devcheck.c"
     gcc -static -o "$HELPERS_DIR/fdcheck"   "$HELPERS_DIR/fdcheck.c"
     gcc -static -o "$HELPERS_DIR/privcheck" "$HELPERS_DIR/privcheck.c"
+    gcc -static -o "$HELPERS_DIR/stubborn"  "$HELPERS_DIR/stubborn.c"
 }
 
 # ================================================================
@@ -590,7 +652,10 @@ test_signal_handling() {
 
     # Send SIGTERM to sandbox
     kill -TERM "$bg_pid" 2>/dev/null || true
-    wait "$bg_pid" 2>/dev/null || true
+    local rc=0
+    wait "$bg_pid" 2>/dev/null || rc=$?
+    assert_exit 1 $rc "SIGTERM without --stop_grace exits 1"
+    assert_output_not_contains "$(cat "$TEST_DIR/signal_out.txt")" "signal=" "the child is killed at once, not sent SIGTERM"
 
     # Sandbox dir should be cleaned up
     if [ ! -d "$TEST_DIR/sbox_signal" ]; then
@@ -724,6 +789,255 @@ test_memlimit_requires_cgroup() {
     assert_output_contains "$out" "without cgroup" "mem_limit rejected without --cgroup"
 }
 
+test_version() {
+    echo "[version]"
+
+    local out rc=0
+    out=$("$SANDBOX_BIN" --version 2>&1) || rc=$?
+    assert_exit 0 $rc "--version exits 0"
+    assert_output_contains "$out" "^2\.4\.0$" "--version prints 2.4.0"
+}
+
+test_uid_refused() {
+    echo "[--uid refused]"
+
+    local echo_args=(--add_elf_file /bin/echo /bin/echo)
+    assert_refused "--uid 0" "^--uid must be in the range 2000000000-2000999999$" \
+        caller uid0 "${echo_args[@]}" --uid 0 -- /bin/echo ran
+    assert_refused "--uid below the range" "^--uid must be in the range" \
+        caller uidlow "${echo_args[@]}" --uid 1999999999 -- /bin/echo ran
+    assert_refused "--uid above the range" "^--uid must be in the range" \
+        caller uidhigh "${echo_args[@]}" --uid 2001000000 -- /bin/echo ran
+    assert_refused "--uid with a sign" "^--uid must be in the range" \
+        caller uidsign "${echo_args[@]}" --uid +2000000001 -- /bin/echo ran
+    assert_refused "--uid with an /etc/passwd entry" "^--uid has an /etc/passwd entry$" \
+        caller_with_etc_line /etc/passwd "sbxtest:x:2000000100:100::/nonexistent:/usr/sbin/nologin" uidpasswd \
+        "${echo_args[@]}" --uid 2000000100 -- /bin/echo ran
+    assert_refused "--uid as a primary GID in /etc/passwd" "^--uid has an /etc/passwd entry$" \
+        caller_with_etc_line /etc/passwd "sbxtest:x:3000:2000000101::/nonexistent:/usr/sbin/nologin" uidpwgid \
+        "${echo_args[@]}" --uid 2000000101 -- /bin/echo ran
+    assert_refused "--uid with an /etc/group entry" "^--uid has an /etc/group entry$" \
+        caller_with_etc_line /etc/group "sbxtest:x:2000000102:" uidgroup \
+        "${echo_args[@]}" --uid 2000000102 -- /bin/echo ran
+    assert_refused "--uid in an /etc/subuid range" "^--uid lies in an /etc/subuid or /etc/subgid range$" \
+        caller_with_etc_line /etc/subuid "sbxtest:2000000200:100" uidsubuid \
+        "${echo_args[@]}" --uid 2000000250 -- /bin/echo ran
+    assert_refused "--uid in an /etc/subgid range" "^--uid lies in an /etc/subuid or /etc/subgid range$" \
+        caller_with_etc_line /etc/subgid "sbxtest:2000000300:100" uidsubgid \
+        "${echo_args[@]}" --uid 2000000399 -- /bin/echo ran
+    assert_refused "--uid of the caller" "^--uid must not be the caller's UID or GID$" \
+        caller_as 2000000400 uidself "${echo_args[@]}" --uid 2000000400 -- /bin/echo ran
+    assert_refused "--uid for a root caller" "^--uid is refused for a root caller$" \
+        sbox uidroot "${echo_args[@]}" --uid 2000000123 -- /bin/echo ran
+}
+
+test_uid_accepted() {
+    echo "[--uid accepted]"
+
+    local out rc=0
+    out=$(caller uidok \
+        --add_elf_file /usr/bin/id /usr/bin/id \
+        --uid 2000000123 \
+        -- /usr/bin/id 2>&1) || rc=$?
+    assert_exit 0 $rc "a non-root caller runs a command with --uid"
+    assert_output_contains "$out" "^uid=2000000123 gid=2000000123 groups=2000000123$" \
+        "the command runs as the UID and GID, with no other group"
+
+    rc=0
+    out=$(caller uidprivs \
+        --add_file "$HELPERS_DIR/privcheck" /bin/privcheck \
+        --uid 2000000123 \
+        -- /bin/privcheck 2>&1) || rc=$?
+    assert_exit 0 $rc "privcheck runs with --uid"
+    assert_output_contains "$out" "no_new_privs=1" "no_new_privs stays with --uid"
+}
+
+test_cpu_max() {
+    echo "[cpu_max]"
+
+    local cg="sandbox_test_cpumax_$$" out="$TEST_DIR/cpumax_out.txt" value
+    "$SANDBOX_BIN" "$TEST_DIR/sbox_cpumax" \
+        --add_file "$HELPERS_DIR/sleeper" /bin/sleeper \
+        --cgroup "$cg" \
+        --cpu_max "50000 100000" \
+        -- /bin/sleeper >"$out" 2>&1 &
+    local bg_pid=$!
+    wait_for_output "$out" "sleeping"
+    value=$(cat "/sys/fs/cgroup/$cg/cpu.max" 2>&1)
+    kill -TERM "$bg_pid" 2>/dev/null || true
+    wait "$bg_pid" 2>/dev/null || true
+    assert_output_contains "$value" "^50000 100000$" "cpu.max is written"
+
+    local echo_args=(--add_elf_file /bin/echo /bin/echo)
+    assert_refused "--cpu_max without --cgroup" "^cannot set cpu.max without cgroup name$" \
+        sbox cpumaxnocg "${echo_args[@]}" --cpu_max "50000 100000" -- /bin/echo ran
+    assert_refused "--cpu_max that is not two numbers" "^--cpu_max must be" \
+        sbox cpumaxbad "${echo_args[@]}" --cgroup "${cg}_bad" --cpu_max "max 100000" -- /bin/echo ran
+    assert_refused "--cpu_max that the kernel rejects" "^cannot (create cgroup|set cpu.max)" \
+        sbox cpumaxkernel "${echo_args[@]}" --cgroup "${cg}_kernel" --cpu_max "100 100000" -- /bin/echo ran
+    rmdir "/sys/fs/cgroup/${cg}_kernel" 2>/dev/null || true
+}
+
+test_tmp_size() {
+    echo "[tmp_size]"
+
+    local out rc=0
+    out=$(sbox tmpsize \
+        --add_elf_file /bin/cat /bin/cat \
+        --tmp_size 1048576 \
+        -- /bin/cat /proc/self/mounts 2>&1) || rc=$?
+    assert_exit 0 $rc "cat runs with --tmp_size"
+    assert_output_contains "$out" "^tmpfs /tmp tmpfs rw,nosuid,nodev,.*size=1024k" "/tmp is a nosuid,nodev tmpfs of 1 MiB"
+
+    out=$(sbox tmpmode \
+        --add_elf_file /usr/bin/stat /usr/bin/stat \
+        --tmp_size 1048576 \
+        -- /usr/bin/stat -c "%a %u" /tmp 2>&1) || true
+    assert_output_contains "$out" "^1777 0$" "the tmpfs has mode 1777"
+
+    out=$(sbox tmpfull \
+        --add_elf_file /bin/dd /bin/dd \
+        --tmp_size 1048576 \
+        -- /bin/dd if=/dev/zero of=/tmp/fill bs=1M count=2 2>&1) || true
+    assert_output_contains "$out" "No space left on device" "the tmpfs holds no more than its size"
+
+    out=$(sbox tmpdisk \
+        --add_elf_file /bin/cat /bin/cat \
+        -- /bin/cat /proc/self/mounts 2>&1) || true
+    assert_output_not_contains "$out" " /tmp " "without --tmp_size /tmp is the on-disk folder"
+
+    local echo_args=(--add_elf_file /bin/echo /bin/echo)
+    assert_refused "--tmp_size 0" "^--tmp_size must be a positive number of bytes$" \
+        sbox tmpzero "${echo_args[@]}" --tmp_size 0 -- /bin/echo ran
+    assert_refused "--tmp_size with a suffix" "^--tmp_size must be a positive number of bytes$" \
+        sbox tmpsuffix "${echo_args[@]}" --tmp_size 1m -- /bin/echo ran
+}
+
+test_stop() {
+    echo "[stop]"
+
+    local fifo="$TEST_DIR/stop.fifo" out bg_pid rc
+    mkfifo -m 600 "$fifo"
+
+    # A byte on the FIFO stops a child that handles SIGTERM, and sandbox exits with the child's code
+    out="$TEST_DIR/stop_fifo.txt"
+    "$SANDBOX_BIN" "$TEST_DIR/sbox_stopfifo" \
+        --add_file "$HELPERS_DIR/sleeper" /bin/sleeper \
+        --stop_fifo "$fifo" \
+        -- /bin/sleeper >"$out" 2>&1 &
+    bg_pid=$!
+    wait_for_output "$out" "sleeping"
+    write_fifo "$fifo" x
+    rc=0; wait "$bg_pid" || rc=$?
+    assert_exit 0 $rc "a child that handles SIGTERM exits 0 on a stop"
+    assert_output_contains "$(cat "$out")" "signal=15" "the child gets SIGTERM"
+
+    # EOF on the FIFO does not stop the child; a byte after it does
+    out="$TEST_DIR/stop_eof.txt"
+    "$SANDBOX_BIN" "$TEST_DIR/sbox_stopeof" \
+        --add_file "$HELPERS_DIR/sleeper" /bin/sleeper \
+        --stop_fifo "$fifo" \
+        --stop_grace 5 \
+        -- /bin/sleeper >"$out" 2>&1 &
+    bg_pid=$!
+    wait_for_output "$out" "sleeping"
+    write_fifo "$fifo"
+    local ticks_before ticks_after
+    ticks_before=$(awk '{print $14 + $15}' "/proc/$bg_pid/stat")
+    sleep 1
+    ticks_after=$(awk '{print $14 + $15}' "/proc/$bg_pid/stat")
+    if kill -0 "$bg_pid" 2>/dev/null && ! grep -q "signal=" "$out"; then
+        pass "EOF on the FIFO does not stop the child"
+    else
+        fail "EOF on the FIFO does not stop the child" "the child stopped"
+    fi
+    if [ $((ticks_after - ticks_before)) -lt 10 ]; then
+        pass "sandbox does not spin after EOF"
+    else
+        fail "sandbox does not spin after EOF" "$((ticks_after - ticks_before)) CPU ticks in 1 s"
+    fi
+    write_fifo "$fifo" x
+    rc=0; wait "$bg_pid" || rc=$?
+    assert_exit 0 $rc "a byte after EOF still stops the child"
+
+    # A child that ignores SIGTERM is killed once the grace has passed
+    out="$TEST_DIR/stop_kill.txt"
+    "$SANDBOX_BIN" "$TEST_DIR/sbox_stopkill" \
+        --add_file "$HELPERS_DIR/stubborn" /bin/stubborn \
+        --stop_fifo "$fifo" \
+        --stop_grace 1 \
+        -- /bin/stubborn >"$out" 2>&1 &
+    bg_pid=$!
+    wait_for_output "$out" "ready"
+    local start_ms=$(( $(date +%s%N) / 1000000 ))
+    write_fifo "$fifo" x
+    rc=0; wait "$bg_pid" || rc=$?
+    local elapsed_ms=$(( $(date +%s%N) / 1000000 - start_ms ))
+    assert_exit 137 $rc "a child that ignores SIGTERM is killed with 137"
+    if [ "$elapsed_ms" -ge 900 ]; then
+        pass "the child is killed only after the grace"
+    else
+        fail "the child is killed only after the grace" "killed after ${elapsed_ms} ms"
+    fi
+
+    # With --stop_grace, SIGTERM to sandbox stops the child the same way
+    out="$TEST_DIR/stop_signal.txt"
+    "$SANDBOX_BIN" "$TEST_DIR/sbox_stopsignal" \
+        --add_file "$HELPERS_DIR/sleeper" /bin/sleeper \
+        --stop_grace 5 \
+        -- /bin/sleeper >"$out" 2>&1 &
+    bg_pid=$!
+    wait_for_output "$out" "sleeping"
+    kill -TERM "$bg_pid"
+    rc=0; wait "$bg_pid" || rc=$?
+    assert_exit 0 $rc "with --stop_grace SIGTERM to sandbox exits with the child's code"
+    assert_output_contains "$(cat "$out")" "signal=15" "with --stop_grace the child gets SIGTERM"
+
+    # A non-root caller stops its --uid child through its own FIFO
+    local own_fifo="$TEST_DIR/caller.fifo"
+    mkfifo -m 600 "$own_fifo"
+    chown "$CALLER_UID" "$own_fifo"
+    out="$TEST_DIR/stop_caller.txt"
+    caller stopcaller \
+        --add_file "$HELPERS_DIR/sleeper" /bin/sleeper \
+        --uid 2000000124 \
+        --stop_fifo "$own_fifo" \
+        -- /bin/sleeper >"$out" 2>&1 &
+    bg_pid=$!
+    wait_for_output "$out" "sleeping"
+    write_fifo "$own_fifo" x
+    rc=0; wait "$bg_pid" || rc=$?
+    assert_exit 0 $rc "a non-root caller stops its --uid child through its FIFO"
+}
+
+test_stop_fifo_refused() {
+    echo "[stop_fifo refused]"
+
+    local dir="$TEST_DIR/fifos" echo_args=(--add_elf_file /bin/echo /bin/echo)
+    mkdir -p "$dir"
+    mkfifo -m 600 "$dir/own" && chown "$CALLER_UID" "$dir/own"
+    ln -s own "$dir/link"
+    mkfifo -m 644 "$dir/other"
+    mkfifo -m 600 "$dir/private"
+    mkfifo -m 620 "$dir/group" && chown "$CALLER_UID" "$dir/group"
+    install -m 600 -o "$CALLER_UID" /dev/null "$dir/file"
+
+    assert_refused "a symlink at the FIFO path" "^cannot open --stop_fifo: Too many levels of symbolic links$" \
+        caller fifolink "${echo_args[@]}" --stop_fifo "$dir/link" -- /bin/echo ran
+    assert_refused "a FIFO owned by another user" "^--stop_fifo is not owned by the caller$" \
+        caller fifoother "${echo_args[@]}" --stop_fifo "$dir/other" -- /bin/echo ran
+    assert_refused "a FIFO the caller cannot open" "^cannot open --stop_fifo: Permission denied$" \
+        caller fifoprivate "${echo_args[@]}" --stop_fifo "$dir/private" -- /bin/echo ran
+    assert_refused "a group-writable FIFO" "^--stop_fifo is writable by its group or others$" \
+        caller fifogroup "${echo_args[@]}" --stop_fifo "$dir/group" -- /bin/echo ran
+    assert_refused "a file that is not a FIFO" "^--stop_fifo is not a FIFO$" \
+        caller fifofile "${echo_args[@]}" --stop_fifo "$dir/file" -- /bin/echo ran
+    assert_refused "--stop_grace 0" "^--stop_grace must be 1-3600 seconds$" \
+        sbox grace0 "${echo_args[@]}" --stop_grace 0 -- /bin/echo ran
+    assert_refused "--stop_grace above an hour" "^--stop_grace must be 1-3600 seconds$" \
+        sbox grace3601 "${echo_args[@]}" --stop_grace 3601 -- /bin/echo ran
+}
+
 # ================================================================
 #                            MAIN
 # ================================================================
@@ -743,6 +1057,8 @@ main() {
 
     echo "Building helper binaries..."
     build_helpers
+    chmod 755 "$TEST_DIR"
+    install -o root -g root -m 4755 "$SANDBOX_BIN" "$CALLER_BIN"
     echo ""
 
     test_basic_execution
@@ -776,6 +1092,13 @@ main() {
     test_nonexistent_command
     test_tmp_world_writable
     test_root_not_writable
+    test_version
+    test_uid_refused
+    test_uid_accepted
+    test_cpu_max
+    test_tmp_size
+    test_stop
+    test_stop_fifo_refused
 
     echo ""
     echo "=== Results ==="

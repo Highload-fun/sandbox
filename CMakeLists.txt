@@ -1,9 +1,10 @@
 cmake_minimum_required(VERSION 3.10)
-project(sandbox)
+project(sandbox VERSION 2.4.0)
 
 set(CMAKE_CXX_STANDARD 17)
 
 add_executable(sandbox main.cpp)
+target_compile_definitions(sandbox PRIVATE SANDBOX_VERSION="${PROJECT_VERSION}")
 
 target_link_libraries(sandbox cgroup)
 

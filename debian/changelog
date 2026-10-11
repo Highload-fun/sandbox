@@ -1,3 +1,16 @@
+sandbox (2.4.0-1) unstable; urgency=medium
+
+  * add --uid: run the command under a UID and GID of 2000000000-2000999999
+    that has no passwd, group, subuid or subgid entry; refused for a root
+    caller, and the IDs are checked after the drop
+  * add --cpu_max: write cpu.max of the cgroup
+  * add --tmp_size: mount a nosuid,nodev tmpfs of the given size at /tmp
+  * add --stop_fifo and --stop_grace: on a byte from the caller's FIFO, or
+    SIGTERM/SIGINT to the tool, send SIGTERM and SIGKILL after the grace
+  * add --version
+
+ -- Sergey Svistunov <sergey-svistunov@yandex.ru>  Sun, 11 Oct 2026 17:15:00 +0000
+
 sandbox (2.3.9-1) unstable; urgency=medium
 
   * add --oom_group: set memory.oom.group=1 so an OOM kill of any process

@@ -53,6 +53,12 @@ The `<sandbox_path>` is a temporary directory created by the tool to serve as th
 | `--oom_group` | Kill every process of the sandbox when the OOM killer kills one (requires `--mem_limit`) |
 | `--save_usage_stat <file>` | Write CPU and memory usage stats after execution |
 | `--exec_dir <path>` | Working directory inside the sandbox (default: `/root`) |
+| `--uid <uid>` | Run the command under this UID and GID instead of 65534 (see [Own UID](#own-uid)) |
+| `--cpu_max "<quota_us> <period_us>"` | Write `cpu.max` of the cgroup, e.g. `"50000 100000"` for half a CPU (requires `--cgroup`) |
+| `--tmp_size <bytes>` | Mount a `nosuid,nodev` tmpfs of this size, mode 1777, at `/tmp` (default: an on-disk folder) |
+| `--stop_fifo <path>` | Stop the command when a byte is read from this FIFO (see [Graceful stop](#graceful-stop)) |
+| `--stop_grace <seconds>` | Stop with SIGTERM, then SIGKILL after this many seconds, 1-3600 (default 30 with `--stop_fifo`) |
+| `--version` | Print the version and exit |
 
 ### Examples
 
@@ -81,8 +87,27 @@ sudo sandbox /tmp/sbox \
 2. Copies requested files/libraries and sets up bind mounts
 3. Optionally creates a cgroup with CPU and memory constraints
 4. Clones a child process with isolated namespaces (`CLONE_NEWNS`, `CLONE_NEWPID`, `CLONE_NEWNET`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWCGROUP`)
-5. Inside the child: chroots, mounts `/dev` and `/proc`, drops privileges to nobody (UID 65534), then exec's the target binary
+5. Inside the child: chroots, mounts `/dev` and `/proc`, drops privileges to nobody (UID 65534) or the `--uid` one, then exec's the target binary
 6. On exit, unmounts all filesystems and removes the sandbox directory
+
+## Own UID
+
+`--uid <uid>` runs the command under that UID and the same GID, with no supplementary groups. The tool checks the IDs after the drop and refuses to run the command otherwise. It accepts only a UID that:
+
+- lies in 2000000000-2000999999, a range fixed at build time;
+- is not the caller's UID or GID;
+- appears in no `/etc/passwd` entry (as UID or primary GID) and no `/etc/group` entry;
+- lies in no `/etc/subuid` or `/etc/subgid` range (a missing file has none; a line it cannot parse refuses).
+
+A root caller cannot use `--uid`. Every refusal prints a fixed message and exits 1.
+
+## Graceful stop
+
+`--stop_fifo <path>` names a FIFO that the caller makes, owns, and that neither its group nor others can write. The tool never creates or changes it: it opens it with the caller's rights, without following a symlink, and refuses anything else. Writing a byte to it stops the command; a writer that closes without writing does not.
+
+A stop sends SIGTERM to the command and SIGKILL once the `--stop_grace` seconds have passed. With `--stop_fifo` or `--stop_grace`, SIGTERM and SIGINT sent to the tool stop the command the same way; without them they kill it at once, and the tool exits 1. After a stop the tool exits with the command's own code, or 137 when the grace ran out.
+
+The command runs as PID 1 of its PID namespace, so it receives SIGTERM only when it handles the signal; a command that does not is killed when the grace ends.
 
 ## External termination
 
