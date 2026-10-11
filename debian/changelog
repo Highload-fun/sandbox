@@ -17,8 +17,8 @@ sandbox (2.4.0-1) unstable; urgency=medium
     starts; the tool still exits 1
   * refuse a stop FIFO that its group or others may read
   * make the on-disk /tmp sticky (1777); copy, not link, someone else's
-    set-ID file for a non-root caller; remove a tree of any depth without
-    recursion
+    set-ID file for a non-root caller; remove a tree of any depth, with the
+    mounts in it, without recursion
 
  -- Sergey Svistunov <sergey-svistunov@yandex.ru>  Sun, 11 Oct 2026 17:15:00 +0000
 

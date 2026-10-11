@@ -1292,6 +1292,31 @@ test_deep_tree() {
     fi
 }
 
+test_deep_mounts() {
+    echo "[mounts deep in the tree]"
+
+    # Binds at and around the depth where the removal walk moves subtrees up: one at that depth is itself
+    # moved, so it must be detached first
+    local host="$TEST_DIR/host_deep" args=() rc=0 d p
+    mkdir -p "$host"
+    echo keep > "$host/keep"
+    for d in 255 256 257 300; do
+        p="/b$d"
+        for _ in $(seq $((d - 1))); do p="$p/a"; done
+        args+=(--mount_dir "$host" "$p")
+    done
+    sbox deepmounts \
+        --add_elf_file /bin/echo /bin/echo \
+        "${args[@]}" \
+        -- /bin/echo ran >/dev/null 2>&1 || rc=$?
+    assert_exit 0 $rc "binds 255 to 300 levels deep are detached and removed"
+    if [ -f "$host/keep" ] && [ ! -e "$TEST_DIR/sbox_deepmounts" ]; then
+        pass "the sandbox is gone and the bound folder is intact"
+    else
+        fail "the sandbox is gone and the bound folder is intact" "the sandbox is left or $host changed"
+    fi
+}
+
 test_link_during_placement() {
     echo "[link planted while files are put in]"
 
@@ -1431,6 +1456,7 @@ main() {
     test_foreign_setid_copied
     test_link_during_placement
     test_deep_tree
+    test_deep_mounts
 
     echo ""
     echo "=== Results ==="

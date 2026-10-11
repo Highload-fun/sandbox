@@ -79,7 +79,7 @@
 #define MAX_STOP_GRACE 3600
 // The removal walk keeps at most this many folders open; a deeper subtree is moved up
 #define MAX_WALK_DEPTH 256
-#define MAX_HOISTS 1000000UL
+#define MAX_HOISTS UINT32_MAX
 
 static_assert(UID_RANGE_MIN > NOBODY_UID && UID_RANGE_MAX < UINT32_MAX, "--uid range");
 
@@ -417,7 +417,9 @@ static void empty_tree(int top_fd) {
         fatal_errno("cannot remove sandbox");
     std::vector<frame> stack;
     stack.push_back({top, {}, 0, 0});
+    // Each move is progress, so only moves count against MAX_HOISTS; the listing bound guards the loop
     unsigned long hoisted = 0;
+    unsigned long long moved_name = 0;
 
     while (!stack.empty()) {
         frame &f = stack.back();
@@ -451,11 +453,23 @@ static void empty_tree(int top_fd) {
             fatal_errno("cannot remove sandbox");
 
         if (stack.size() >= MAX_WALK_DEPTH) {
+            // A mount point cannot be moved: detach what is mounted on the folder first
+            int fd = open_dir_detaching(f.fd, name);
+            if (fd < 0) {
+                if (errno != ENOENT && errno != ENOTDIR && errno != ELOOP)
+                    fatal_errno("cannot remove sandbox");
+                continue;
+            }
+            close(fd);
+            if (hoisted >= MAX_HOISTS)
+                fatal("cannot remove sandbox: its folders keep changing");
             for (;;) {
-                if (++hoisted > MAX_HOISTS)
-                    fatal("cannot remove sandbox: its folders keep changing");
-                auto moved = ".sandbox-deep-" + std::to_string(hoisted);
-                if (renameat2(f.fd, name, stack.front().fd, moved.c_str(), RENAME_NOREPLACE) == 0 || errno == ENOENT)
+                auto moved = ".sandbox-deep-" + std::to_string(++moved_name);
+                if (renameat2(f.fd, name, stack.front().fd, moved.c_str(), RENAME_NOREPLACE) == 0) {
+                    hoisted++;
+                    break;
+                }
+                if (errno == ENOENT || errno == EBUSY)
                     break;
                 if (errno != EEXIST)
                     fatal_errno("cannot remove sandbox");
