@@ -8,6 +8,14 @@ sandbox (2.4.0-1) unstable; urgency=medium
   * add --stop_fifo and --stop_grace: on a byte from the caller's FIFO, or
     SIGTERM/SIGINT to the tool, send SIGTERM and SIGKILL after the grace
   * add --version
+  * build the sandbox tree through file descriptors; refuse sandbox parents
+    not owned by the caller, other than a shared sticky folder such as /tmp
+  * follow no link in the tree and enter no mount when removing it; put files
+    in before mounts, refuse a mount under another mount, copy files without
+    set-ID bits, and run ldd as the caller
+  * a SIGTERM or SIGINT during setup now kills the child as soon as it
+    starts; the tool still exits 1
+  * refuse a stop FIFO that its group or others may read
 
  -- Sergey Svistunov <sergey-svistunov@yandex.ru>  Sun, 11 Oct 2026 17:15:00 +0000
 

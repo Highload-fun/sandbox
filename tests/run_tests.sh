@@ -12,9 +12,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEST_DIR="/tmp/sandbox_tests_$$"
 HELPERS_DIR="$TEST_DIR/helpers"
-# A non-root caller for the flags that refuse root; it runs a setuid copy of the binary in TEST_DIR
+# A non-root caller for the flags that refuse root; it runs a setuid copy of the binary in TEST_DIR,
+# with its sandboxes in a folder of its own
 CALLER_UID=65533
 CALLER_BIN="$TEST_DIR/sandbox"
+CALLER_DIR="$TEST_DIR/caller"
 PASSED=0
 FAILED=0
 ERRORS=()
@@ -92,10 +94,16 @@ sbox() {
     "$SANDBOX_BIN" "$TEST_DIR/sbox_$tag" "$@"
 }
 
+caller_at() {
+    # caller_at <uid> <sandbox path> <args...>: runs the sandbox as a non-root caller
+    local uid="$1"; shift
+    setpriv --reuid="$uid" --regid="$uid" --clear-groups "$CALLER_BIN" "$@"
+}
+
 caller_as() {
     # Like sbox, as a non-root caller
     local uid="$1" tag="$2"; shift 2
-    setpriv --reuid="$uid" --regid="$uid" --clear-groups "$CALLER_BIN" "$TEST_DIR/sbox_$tag" "$@"
+    caller_at "$uid" "$CALLER_DIR/sbox_$tag" "$@"
 }
 
 caller() {
@@ -108,7 +116,7 @@ caller_with_etc_line() {
     local fake="$TEST_DIR/etc_$tag"
     { cat "$file"; echo "$line"; } > "$fake"
     unshare -m sh -c 'mount --bind "$1" "$2" && shift 2 && exec "$@"' sh "$fake" "$file" \
-        setpriv --reuid="$CALLER_UID" --regid="$CALLER_UID" --clear-groups "$CALLER_BIN" "$TEST_DIR/sbox_$tag" "$@"
+        setpriv --reuid="$CALLER_UID" --regid="$CALLER_UID" --clear-groups "$CALLER_BIN" "$CALLER_DIR/sbox_$tag" "$@"
 }
 
 assert_refused() {
@@ -819,12 +827,20 @@ test_uid_refused() {
     assert_refused "--uid with an /etc/group entry" "^--uid has an /etc/group entry$" \
         caller_with_etc_line /etc/group "sbxtest:x:2000000102:" uidgroup \
         "${echo_args[@]}" --uid 2000000102 -- /bin/echo ran
-    assert_refused "--uid in an /etc/subuid range" "^--uid lies in an /etc/subuid or /etc/subgid range$" \
-        caller_with_etc_line /etc/subuid "sbxtest:2000000200:100" uidsubuid \
-        "${echo_args[@]}" --uid 2000000250 -- /bin/echo ran
-    assert_refused "--uid in an /etc/subgid range" "^--uid lies in an /etc/subuid or /etc/subgid range$" \
-        caller_with_etc_line /etc/subgid "sbxtest:2000000300:100" uidsubgid \
-        "${echo_args[@]}" --uid 2000000399 -- /bin/echo ran
+    if [ -e /etc/subuid ]; then
+        assert_refused "--uid in an /etc/subuid range" "^--uid lies in an /etc/subuid or /etc/subgid range$" \
+            caller_with_etc_line /etc/subuid "sbxtest:2000000200:100" uidsubuid \
+            "${echo_args[@]}" --uid 2000000250 -- /bin/echo ran
+    else
+        echo "  SKIP: --uid in an /etc/subuid range (no /etc/subuid on this host)"
+    fi
+    if [ -e /etc/subgid ]; then
+        assert_refused "--uid in an /etc/subgid range" "^--uid lies in an /etc/subuid or /etc/subgid range$" \
+            caller_with_etc_line /etc/subgid "sbxtest:2000000300:100" uidsubgid \
+            "${echo_args[@]}" --uid 2000000399 -- /bin/echo ran
+    else
+        echo "  SKIP: --uid in an /etc/subgid range (no /etc/subgid on this host)"
+    fi
     assert_refused "--uid of the caller" "^--uid must not be the caller's UID or GID$" \
         caller_as 2000000400 uidself "${echo_args[@]}" --uid 2000000400 -- /bin/echo ran
     assert_refused "--uid for a root caller" "^--uid is refused for a root caller$" \
@@ -1008,6 +1024,20 @@ test_stop() {
     write_fifo "$own_fifo" x
     rc=0; wait "$bg_pid" || rc=$?
     assert_exit 0 $rc "a non-root caller stops its --uid child through its FIFO"
+
+    # A stop byte written before the child starts still stops it
+    local early="$TEST_DIR/early.fifo"
+    mkfifo -m 600 "$early"
+    exec 3<>"$early"
+    printf x >&3
+    rc=0
+    sbox stopearly \
+        --add_file "$HELPERS_DIR/stubborn" /bin/stubborn \
+        --stop_fifo "$early" \
+        --stop_grace 1 \
+        -- /bin/stubborn >/dev/null 2>&1 || rc=$?
+    exec 3>&-
+    assert_exit 137 $rc "a stop byte written before the child starts stops it"
 }
 
 test_stop_fifo_refused() {
@@ -1020,6 +1050,7 @@ test_stop_fifo_refused() {
     mkfifo -m 644 "$dir/other"
     mkfifo -m 600 "$dir/private"
     mkfifo -m 620 "$dir/group" && chown "$CALLER_UID" "$dir/group"
+    mkfifo -m 604 "$dir/readable" && chown "$CALLER_UID" "$dir/readable"
     install -m 600 -o "$CALLER_UID" /dev/null "$dir/file"
 
     assert_refused "a symlink at the FIFO path" "^cannot open --stop_fifo: Too many levels of symbolic links$" \
@@ -1028,14 +1059,196 @@ test_stop_fifo_refused() {
         caller fifoother "${echo_args[@]}" --stop_fifo "$dir/other" -- /bin/echo ran
     assert_refused "a FIFO the caller cannot open" "^cannot open --stop_fifo: Permission denied$" \
         caller fifoprivate "${echo_args[@]}" --stop_fifo "$dir/private" -- /bin/echo ran
-    assert_refused "a group-writable FIFO" "^--stop_fifo is writable by its group or others$" \
+    assert_refused "a group-writable FIFO" "^--stop_fifo is readable or writable by its group or others$" \
         caller fifogroup "${echo_args[@]}" --stop_fifo "$dir/group" -- /bin/echo ran
+    assert_refused "a FIFO others may read" "^--stop_fifo is readable or writable by its group or others$" \
+        caller fiforeadable "${echo_args[@]}" --stop_fifo "$dir/readable" -- /bin/echo ran
+    assert_refused "--stop_fifo given twice" "^--stop_fifo is given twice$" \
+        caller fifotwice "${echo_args[@]}" --stop_fifo "$dir/own" --stop_fifo "$dir/own" -- /bin/echo ran
     assert_refused "a file that is not a FIFO" "^--stop_fifo is not a FIFO$" \
         caller fifofile "${echo_args[@]}" --stop_fifo "$dir/file" -- /bin/echo ran
     assert_refused "--stop_grace 0" "^--stop_grace must be 1-3600 seconds$" \
         sbox grace0 "${echo_args[@]}" --stop_grace 0 -- /bin/echo ran
     assert_refused "--stop_grace above an hour" "^--stop_grace must be 1-3600 seconds$" \
         sbox grace3601 "${echo_args[@]}" --stop_grace 3601 -- /bin/echo ran
+}
+
+test_sandbox_parent() {
+    echo "[sandbox parent]"
+
+    local echo_args=(--add_elf_file /bin/echo /bin/echo) rootdir="$TEST_DIR/rootparent" shared="$TEST_DIR/shared"
+    local out rc
+    mkdir -m 755 "$rootdir"
+    ln -s "$rootdir" "$CALLER_DIR/link"
+    chown -h "$CALLER_UID" "$CALLER_DIR/link"
+
+    # A non-root caller may not make its sandbox in a folder it does not own, even through its own link
+    assert_refused "a root-owned parent" "^sandbox parent must be owned by the caller$" \
+        caller_at "$CALLER_UID" "$rootdir/sb" "${echo_args[@]}" -- /bin/echo ran
+    assert_refused "a root-owned parent through the caller's link" "^sandbox parent must be owned by the caller$" \
+        caller_at "$CALLER_UID" "$CALLER_DIR/link/sb" "${echo_args[@]}" -- /bin/echo ran
+    if [ ! -e "$rootdir/sb" ]; then
+        pass "nothing is made in a parent the caller does not own"
+    else
+        fail "nothing is made in a parent the caller does not own" "$rootdir/sb exists"
+    fi
+
+    # A root-owned sticky folder that everyone may write, like /tmp, is accepted
+    install -d -m 1777 "$shared"
+    rc=0
+    out=$(caller_at "$CALLER_UID" "$shared/sb" "${echo_args[@]}" -- /bin/echo ran 2>&1) || rc=$?
+    assert_exit 0 $rc "a sticky folder everyone may write is a parent"
+    assert_output_contains "$out" "^ran$" "the command runs in it"
+
+    # There a root-owned folder may be anyone's, so it is not taken over; the caller's own one is
+    mkdir "$shared/taken"
+    echo keep > "$shared/taken/keep"
+    assert_refused "a root-owned folder in a shared parent" "^sandbox path holds a folder of someone else$" \
+        caller_at "$CALLER_UID" "$shared/taken" "${echo_args[@]}" -- /bin/echo ran
+    if [ -f "$shared/taken/keep" ]; then
+        pass "the root-owned folder is left as it was"
+    else
+        fail "the root-owned folder is left as it was" "keep is gone"
+    fi
+    install -d -o "$CALLER_UID" "$shared/mine"
+    rc=0
+    caller_at "$CALLER_UID" "$shared/mine" "${echo_args[@]}" -- /bin/echo ran >/dev/null 2>&1 || rc=$?
+    assert_exit 0 $rc "the caller's own folder in a shared parent is replaced"
+}
+
+test_earlier_sandbox() {
+    echo "[earlier sandbox folder]"
+
+    local echo_args=(--add_elf_file /bin/echo /bin/echo) host="$TEST_DIR/host_etc" old="$CALLER_DIR/sbox_old"
+    local out rc=0
+    mkdir -p "$host" "$old/tmp"
+    echo keep > "$host/keep"
+    ln -s "$host" "$old/tmp/evil"
+    ln -s "$host/keep" "$old/tmp/evil_file"
+    chown -hR "$CALLER_UID" "$old"
+
+    # What an earlier run left is removed without following its links, and the new tree is fresh
+    out=$(caller old "${echo_args[@]}" --add_file /etc/hostname /tmp/evil/pwned -- /bin/echo ran 2>&1) || rc=$?
+    assert_exit 0 $rc "an earlier sandbox folder with links in it is replaced"
+    if [ -f "$host/keep" ] && [ ! -e "$host/pwned" ]; then
+        pass "its links are removed, not followed"
+    else
+        fail "its links are removed, not followed" "the folder they lead to changed"
+    fi
+
+    ln -s "$host" "$CALLER_DIR/sbox_link"
+    chown -h "$CALLER_UID" "$CALLER_DIR/sbox_link"
+    assert_refused "a link at the sandbox path" "^sandbox path is a link or a file$" \
+        caller link "${echo_args[@]}" -- /bin/echo ran
+}
+
+test_links_planted_by_the_command() {
+    echo "[links planted by the command]"
+
+    local host="$TEST_DIR/host_dir" out rc=0
+    mkdir -p "$host"
+    echo keep > "$host/keep"
+
+    # Without --tmp_size, /tmp is on disk: the command's links there must not lead the cleanup out
+    out=$(sbox planted \
+        --add_elf_file /bin/ln /bin/ln \
+        -- /bin/ln -s "$host" "$host/keep" /tmp/ 2>&1) || rc=$?
+    assert_exit 0 $rc "the command plants links in /tmp"
+    if [ -f "$host/keep" ]; then
+        pass "the cleanup does not follow them"
+    else
+        fail "the cleanup does not follow them" "$host/keep is gone"
+    fi
+    if [ ! -e "$TEST_DIR/sbox_planted" ]; then
+        pass "the sandbox is removed"
+    else
+        fail "the sandbox is removed" "it is still there"
+    fi
+}
+
+test_sandbox_moved() {
+    echo "[sandbox folder moved during a run]"
+
+    local host="$TEST_DIR/host_mount" decoy="$TEST_DIR/decoy" fifo="$TEST_DIR/moved.fifo"
+    local out="$TEST_DIR/moved_out.txt" leaf="$CALLER_DIR/sbox_moved" rc=0
+    mkdir -p "$host" "$decoy"
+    echo keep > "$host/keep"
+    echo keep > "$decoy/keep"
+    mkfifo -m 600 "$fifo"
+    chown "$CALLER_UID" "$fifo"
+
+    caller moved \
+        --add_file "$HELPERS_DIR/sleeper" /bin/sleeper \
+        --mount_dir "$host" /mnt \
+        --stop_fifo "$fifo" \
+        -- /bin/sleeper >"$out" 2>&1 &
+    local bg_pid=$!
+    wait_for_output "$out" "sleeping"
+
+    # The caller owns the parent, so it can move the folder and put a link in its place
+    mv "$leaf" "$leaf.away"
+    ln -s "$decoy" "$leaf"
+    write_fifo "$fifo" x
+    wait "$bg_pid" || rc=$?
+
+    assert_exit 1 $rc "a moved sandbox folder fails the run"
+    assert_output_contains "$(cat "$out")" "^cannot remove sandbox: its folder was moved$" "the move is reported"
+    if [ -f "$host/keep" ] && [ -f "$decoy/keep" ]; then
+        pass "the cleanup reaches neither the mount source nor the link's target"
+    else
+        fail "the cleanup reaches neither the mount source nor the link's target" "a keep file is gone"
+    fi
+    if [ -z "$(ls -A "$leaf.away")" ]; then
+        pass "the moved folder is emptied through its descriptor"
+    else
+        fail "the moved folder is emptied through its descriptor" "it is not empty"
+    fi
+}
+
+test_mount_rules() {
+    echo "[mount rules]"
+
+    local echo_args=(--add_elf_file /bin/echo /bin/echo) a="$TEST_DIR/mount_a" b="$TEST_DIR/mount_b" rc=0
+    mkdir -p "$a" "$b"
+    echo keep > "$a/keep"
+
+    assert_refused "a mount under another mount" "a link, a file or a mount is in the way$" \
+        sbox nested "${echo_args[@]}" --mount_dir "$a" /mnt --mount_dir "$b" /mnt/x -- /bin/echo ran
+    if [ ! -e "$a/x" ]; then
+        pass "nothing is made in a mounted host folder"
+    else
+        fail "nothing is made in a mounted host folder" "$a/x exists"
+    fi
+
+    sbox fileunder \
+        --mount_dir "$a" /mnt \
+        --add_file /etc/hostname /mnt/hostname \
+        "${echo_args[@]}" \
+        -- /bin/echo ran >/dev/null 2>&1 || rc=$?
+    assert_exit 0 $rc "files are put in before the mounts"
+    if [ ! -e "$a/hostname" ]; then
+        pass "a file never goes through a mount into a host folder"
+    else
+        fail "a file never goes through a mount into a host folder" "$a/hostname exists"
+    fi
+
+    assert_refused "a mount at the sandbox root" "^mount destination must not be the sandbox root$" \
+        sbox mountroot "${echo_args[@]}" --mount_dir "$a" / -- /bin/echo ran
+}
+
+test_copy_drops_setid() {
+    echo "[copies drop set-ID bits]"
+
+    # /dev/shm is another filesystem, so the file is copied, by root
+    local src="/dev/shm/sandbox_test_setid_$$" out rc=0
+    install -o "$CALLER_UID" -m 4755 "$HELPERS_DIR/privcheck" "$src"
+    out=$(caller setid \
+        --add_elf_file /usr/bin/stat /usr/bin/stat \
+        --add_file "$src" /setid \
+        -- /usr/bin/stat -c "%a %u" /setid 2>&1) || rc=$?
+    rm -f "$src"
+    assert_exit 0 $rc "stat runs on the copy"
+    assert_output_contains "$out" "^755 0$" "the root-owned copy has no set-ID bit"
 }
 
 # ================================================================
@@ -1059,6 +1272,11 @@ main() {
     build_helpers
     chmod 755 "$TEST_DIR"
     install -o root -g root -m 4755 "$SANDBOX_BIN" "$CALLER_BIN"
+    install -d -o "$CALLER_UID" -g "$CALLER_UID" -m 700 "$CALLER_DIR"
+    if findmnt -no OPTIONS -T "$TEST_DIR" | grep -qw nosuid; then
+        echo "ERROR: $TEST_DIR is on a nosuid mount, so the non-root caller cannot run the setuid copy" >&2
+        exit 1
+    fi
     echo ""
 
     test_basic_execution
@@ -1099,6 +1317,12 @@ main() {
     test_tmp_size
     test_stop
     test_stop_fifo_refused
+    test_sandbox_parent
+    test_earlier_sandbox
+    test_links_planted_by_the_command
+    test_sandbox_moved
+    test_mount_rules
+    test_copy_drops_setid
 
     echo ""
     echo "=== Results ==="

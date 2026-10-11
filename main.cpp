@@ -4,7 +4,6 @@
 
 #include <iostream>
 #include <fstream>
-#include <array>
 #include <vector>
 #include <string>
 #include <regex>
@@ -25,9 +24,11 @@
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <grp.h>            // setgroups
-#include <mntent.h>
+#include <linux/openat2.h>  // struct open_how, RESOLVE_*
 #include <linux/sched.h>    // struct clone_args, CLONE_INTO_CGROUP
 #include <linux/filter.h>   // sock_filter, sock_fprog, BPF_*
 #include <linux/seccomp.h>  // SECCOMP_*, struct seccomp_data
@@ -41,6 +42,28 @@
 
 #ifndef __NR_clone3
 #define __NR_clone3 435
+#endif
+
+#ifndef __NR_open_tree
+#define __NR_open_tree 428
+#endif
+#ifndef __NR_move_mount
+#define __NR_move_mount 429
+#endif
+#ifndef __NR_openat2
+#define __NR_openat2 437
+#endif
+#ifndef OPEN_TREE_CLONE
+#define OPEN_TREE_CLONE 1
+#endif
+#ifndef OPEN_TREE_CLOEXEC
+#define OPEN_TREE_CLOEXEC O_CLOEXEC
+#endif
+#ifndef MOVE_MOUNT_F_EMPTY_PATH
+#define MOVE_MOUNT_F_EMPTY_PATH 0x00000004
+#endif
+#ifndef AT_RECURSIVE
+#define AT_RECURSIVE 0x8000
 #endif
 
 
@@ -75,7 +98,17 @@ static volatile sig_atomic_t stop_grace = 0;
 // Write end of the pipe that wakes the wait for the child
 static volatile sig_atomic_t wake_fd = -1;
 static pid_t pid;
+static bool is_child = false;
+// The sandbox path: its parent is opened once, with the caller's rights, and then the tree is reached only
+// through parent_fd and sandbox_fd
 static fs::path sandbox = {};
+static std::string leaf;
+static int parent_fd = -1;
+static bool parent_is_callers = false;
+static int sandbox_fd = -1;
+static int tmp_fd = -1;
+// A detached clone of the tree, the child's root to be
+static int tree_fd = -1;
 static cgroup *sandbox_cgroup = nullptr;
 static uid_t caller_uid;
 static gid_t caller_gid;
@@ -95,10 +128,22 @@ void fatal_cgroup(const std::string &message) {
     exit(EXIT_FAILURE);
 }
 
-// Execute a command without shell interpolation (fix: command injection via popen)
-std::string exec_command(const char *path, std::vector<const char *> args) {
+// Opens paths with the caller's rights until restore_privileges()
+static void drop_privileges(const std::string &what) {
+    if (setegid(caller_gid) || seteuid(caller_uid))
+        fatal_errno("cannot drop privileges for " + what);
+}
+
+static void restore_privileges() {
+    if (seteuid(0) || setegid(0))
+        fatal_errno("cannot restore privileges");
+}
+
+// Runs a command with the caller's IDs, without a shell (fix: command injection via popen), and returns
+// its stdout
+std::string exec_as_caller(const char *path, std::vector<const char *> args) {
     int pipefd[2];
-    if (pipe(pipefd))
+    if (pipe2(pipefd, O_CLOEXEC))
         fatal_errno("cannot create pipe");
 
     pid_t child = fork();
@@ -106,6 +151,8 @@ std::string exec_command(const char *path, std::vector<const char *> args) {
         fatal_errno("cannot fork");
 
     if (child == 0) {
+        if (setresgid(caller_gid, caller_gid, caller_gid) || setresuid(caller_uid, caller_uid, caller_uid))
+            _exit(EXIT_FAILURE);
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
@@ -280,20 +327,12 @@ std::string parse_cpu_max(const std::string &value) {
 }
 
 // Opens the stop FIFO with the caller's rights and accepts only a FIFO that the caller owns and that
-// neither its group nor others may write to. The checks are on the open fd, never the path.
+// neither its group nor others may read or write. The checks are on the open fd, never the path.
 int open_stop_fifo(const char *path) {
-    if (setegid(caller_gid))
-        fatal_errno("cannot drop privileges for --stop_fifo");
-    if (seteuid(caller_uid))
-        fatal_errno("cannot drop privileges for --stop_fifo");
-
+    drop_privileges("--stop_fifo");
     int fd = open(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
     int open_errno = errno;
-
-    if (seteuid(0))
-        fatal_errno("cannot restore privileges");
-    if (setegid(0))
-        fatal_errno("cannot restore privileges");
+    restore_privileges();
 
     if (fd < 0) {
         errno = open_errno;
@@ -307,8 +346,8 @@ int open_stop_fifo(const char *path) {
         fatal("--stop_fifo is not a FIFO");
     if (st.st_uid != caller_uid)
         fatal("--stop_fifo is not owned by the caller");
-    if (st.st_mode & (S_IWGRP | S_IWOTH))
-        fatal("--stop_fifo is writable by its group or others");
+    if (st.st_mode & (S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH))
+        fatal("--stop_fifo is readable or writable by its group or others");
 
     // Hold a write end of the same FIFO, so a writer that closes is never seen as EOF or POLLHUP. It stays
     // open until the tool exits.
@@ -319,109 +358,241 @@ int open_stop_fifo(const char *path) {
     return fd;
 }
 
-void path_pids(std::vector<int> &res) {
-    if (!fs::exists(sandbox)) {
-        return;
-    }
-
-    std::string sandbox_str = sandbox.string();
-    std::vector<const char *> args = {
-        "/usr/bin/lsof", "-n", "-w", "-Fp", "+d", sandbox_str.c_str(), nullptr
-    };
-    std::string out_buf = exec_command("/usr/bin/lsof", args);
-
-    static const std::regex re(R"(p([0-9]+))");
-
-    for (std::sregex_iterator it(out_buf.begin(), out_buf.end(), re), end;
-         it != end; ++it) {
-        const std::smatch &m = *it;
-        if (m.size() < 2) {
-            continue;
-        }
-
-        int pid = std::stoi(m.str(1));
-        res.push_back(pid);
-    }
+// Opens the folder name of dir_fd without following a link or crossing into a mount
+static int open_child_dir(int dir_fd, const char *name) {
+    struct open_how how = {};
+    how.flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+    how.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV;
+    return static_cast<int>(syscall(__NR_openat2, dir_fd, name, &how, sizeof(how)));
 }
 
-void kill_all_sandbox_processes() {
-    // Kill all processes that use the path
-    std::vector<int> pids;
-    path_pids(pids);
+// Detaches the mount on the entry name of dir_fd. The tool's mount namespace is its own, so this never
+// touches the host's mounts.
+static void detach_mount(int dir_fd, const char *name) {
+    int fd = openat(dir_fd, name, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        fatal_errno("cannot open a mount in the sandbox");
+    auto mounted = "/proc/self/fd/" + std::to_string(fd);
+    if (umount2(mounted.c_str(), MNT_DETACH))
+        fatal_errno("cannot umount a mount in the sandbox");
+    close(fd);
+}
+
+// Opens the folder name of dir_fd; a mount on it is detached first
+static int open_dir_detaching(int dir_fd, const char *name) {
+    int fd;
+    for (int i = 0; (fd = open_child_dir(dir_fd, name)) < 0 && errno == EXDEV && i < 100; i++)
+        detach_mount(dir_fd, name);
+    return fd;
+}
+
+static std::vector<std::string> list_dir(int dir_fd) {
+    int fd = openat(dir_fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    DIR *dir = fd < 0 ? nullptr : fdopendir(fd);
+    if (!dir)
+        fatal_errno("cannot read a folder of the sandbox");
+    std::vector<std::string> names;
+    while (auto entry = readdir(dir))
+        if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0)
+            names.emplace_back(entry->d_name);
+    closedir(dir);
+    return names;
+}
+
+static void remove_entry(int dir_fd, const char *name);
+
+// Removes everything in the folder dir_fd. It never follows a link and never enters a mount: a mount
+// inside is detached, and the folder under it removed.
+static void empty_tree(int dir_fd) {
+    for (int round = 0; round < 3; round++) {
+        auto names = list_dir(dir_fd);
+        if (names.empty())
+            return;
+        for (const auto &name: names)
+            remove_entry(dir_fd, name.c_str());
+    }
+    fatal("cannot remove sandbox: its folders keep changing");
+}
+
+static void remove_entry(int dir_fd, const char *name) {
+    for (int i = 0; i < 100; i++) {
+        if (unlinkat(dir_fd, name, 0) == 0 || errno == ENOENT)
+            return;
+        if (errno == EBUSY) {
+            detach_mount(dir_fd, name);
+            continue;
+        }
+        if (errno != EISDIR)
+            fatal_errno("cannot remove sandbox");
+
+        int fd = open_dir_detaching(dir_fd, name);
+        if (fd < 0) {
+            // The entry changed between the two calls: look at it again
+            if (errno == ENOENT || errno == ENOTDIR || errno == ELOOP)
+                continue;
+            fatal_errno("cannot remove sandbox");
+        }
+        empty_tree(fd);
+        close(fd);
+        if (unlinkat(dir_fd, name, AT_REMOVEDIR) == 0 || errno == ENOENT)
+            return;
+        if (errno != ENOTEMPTY && errno != EEXIST)
+            fatal_errno("cannot remove sandbox");
+    }
+    fatal("cannot remove sandbox: its folders keep changing");
+}
+
+// Removes the sandbox folder from its parent, unless the name no longer leads to it
+static void remove_leaf(const struct stat &dir) {
+    struct stat now;
+    if (fstatat(parent_fd, leaf.c_str(), &now, AT_SYMLINK_NOFOLLOW) || now.st_dev != dir.st_dev ||
+        now.st_ino != dir.st_ino)
+        fatal("cannot remove sandbox: its folder was moved");
+    if (unlinkat(parent_fd, leaf.c_str(), AT_REMOVEDIR))
+        fatal_errno("cannot remove sandbox");
+}
+
+static bool is_folder(const std::string &path, const struct stat &dir) {
+    struct stat st;
+    return stat(path.c_str(), &st) == 0 && st.st_dev == dir.st_dev && st.st_ino == dir.st_ino;
+}
+
+// Kills what an earlier run on this sandbox path left running: the processes of root, the caller,
+// nobody or the --uid range whose root, working folder or an open file is the folder dir
+static void kill_processes_using(const struct stat &dir) {
+    std::vector<pid_t> pids;
+    DIR *proc = opendir("/proc");
+    if (!proc)
+        fatal_errno("cannot open /proc");
+    while (auto entry = readdir(proc)) {
+        char *end;
+        long p = strtol(entry->d_name, &end, 10);
+        if (*end != '\0' || p <= 0 || p == getpid())
+            continue;
+
+        auto base = std::string("/proc/") + entry->d_name;
+        struct stat st;
+        if (stat(base.c_str(), &st) || !(st.st_uid == 0 || st.st_uid == caller_uid || st.st_uid == NOBODY_UID ||
+                                         (st.st_uid >= UID_RANGE_MIN && st.st_uid <= UID_RANGE_MAX)))
+            continue;
+
+        bool uses = is_folder(base + "/root", dir) || is_folder(base + "/cwd", dir);
+        if (DIR *fds = uses ? nullptr : opendir((base + "/fd").c_str())) {
+            while (auto fd = readdir(fds))
+                if (fd->d_name[0] != '.' && is_folder(base + "/fd/" + fd->d_name, dir))
+                    uses = true;
+            closedir(fds);
+        }
+        if (uses)
+            pids.push_back(static_cast<pid_t>(p));
+    }
+    closedir(proc);
+
     for (auto p: pids) {
         std::cerr << "Kill pid " << p << std::endl;
         kill(p, SIGKILL);
     }
-
     for (auto p: pids)
         waitpid(p, nullptr, 0);
 }
 
-// Match mount dir against sandbox path with a component-boundary check, so
-// sandbox="/tmp/a" does not spuriously match a mount at "/tmp/abc/...".
-static bool mount_is_under_sandbox(const char *mnt_dir) {
-    const std::string &sb = sandbox.native();
-    std::string m(mnt_dir);
-    if (m.size() < sb.size())
-        return false;
-    if (m.compare(0, sb.size(), sb) != 0)
-        return false;
-    return m.size() == sb.size() || m[sb.size()] == '/';
+// Opens the sandbox's parent folder with the caller's rights. It is accepted when the caller is root or
+// owns it, or when it is a root-owned sticky folder that everyone may write, such as /tmp.
+void open_parent() {
+    leaf = sandbox.filename().string();
+    if (leaf.empty() || leaf == "." || leaf == "..")
+        fatal("sandbox path must name a folder");
+
+    drop_privileges("the sandbox parent");
+    parent_fd = open(sandbox.parent_path().c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
+    int open_errno = errno;
+    restore_privileges();
+    if (parent_fd < 0) {
+        errno = open_errno;
+        fatal_errno("cannot open the sandbox parent");
+    }
+
+    struct stat st;
+    if (fstat(parent_fd, &st))
+        fatal_errno("cannot stat the sandbox parent");
+    parent_is_callers = caller_uid == 0 || st.st_uid == caller_uid;
+    bool shared = st.st_uid == 0 && (st.st_mode & S_ISVTX) && (st.st_mode & S_IWOTH);
+    if (!parent_is_callers && !shared)
+        fatal("sandbox parent must be owned by the caller");
 }
 
-void remove_sandbox_path() {
-    if (!fs::exists(sandbox)) {
+// Removes what an earlier run left at the sandbox path, then makes the sandbox folder, owned by root.
+// From here on the tree is reached only through sandbox_fd, so moving or replacing the folder by its
+// name redirects nothing.
+void make_sandbox() {
+    int old = open_dir_detaching(parent_fd, leaf.c_str());
+    if (old >= 0) {
+        struct stat st;
+        if (fstat(old, &st))
+            fatal_errno("cannot stat the sandbox path");
+        // In a shared parent such as /tmp a root-owned folder may be anyone's, not an earlier run's
+        if (!(st.st_uid == caller_uid || (st.st_uid == 0 && parent_is_callers) || caller_uid == 0))
+            fatal("sandbox path holds a folder of someone else");
+        kill_processes_using(st);
+        empty_tree(old);
+        close(old);
+        remove_leaf(st);
+    } else if (errno == ELOOP || errno == ENOTDIR) {
+        fatal("sandbox path is a link or a file");
+    } else if (errno != ENOENT) {
+        fatal_errno("cannot open the sandbox path");
+    }
+
+    if (mkdirat(parent_fd, leaf.c_str(), 0755))
+        fatal_errno("cannot create the sandbox folder");
+    sandbox_fd = open_child_dir(parent_fd, leaf.c_str());
+    struct stat st;
+    if (sandbox_fd < 0 || fstat(sandbox_fd, &st))
+        fatal_errno("cannot open the sandbox folder");
+    if (st.st_uid != 0 || !list_dir(sandbox_fd).empty())
+        fatal("sandbox folder was replaced while it was made");
+    if (fchmod(sandbox_fd, 0755))
+        fatal_errno("cannot set mode 755 for the sandbox folder");
+}
+
+void remove_sandbox() {
+    if (sandbox_fd < 0)
         return;
+
+    // A deep tree needs a descriptor per level
+    struct rlimit nofile;
+    if (getrlimit(RLIMIT_NOFILE, &nofile) == 0) {
+        nofile.rlim_cur = nofile.rlim_max;
+        setrlimit(RLIMIT_NOFILE, &nofile);
     }
 
-    // Detach every mount that lives under the sandbox path. MNT_DETACH
-    // (lazy unmount) removes the mount from the filesystem tree
-    // immediately and lets the kernel finish cleanup once references drop.
-    // The previous MNT_FORCE+1000-retry loop could hold a worker for ~10s
-    // per busy mount (e.g. C# bind-mounts of /lib, /usr/lib), wedging the
-    // checker's worker pool when several runs cleaned up back-to-back.
-    auto mounts_f = setmntent("/proc/mounts", "r");
-    if (!mounts_f)
-        fatal_errno("cannot open /proc/mounts");
-    while (auto mounts = getmntent(mounts_f)) {
-        if (!mount_is_under_sandbox(mounts->mnt_dir))
-            continue;
-
-        if (umount2(mounts->mnt_dir, MNT_DETACH))
-            fatal_errno(std::string("cannot umount ") + mounts->mnt_dir);
-    }
-    endmntent(mounts_f);
-
-    // Defence in depth: re-scan /proc/mounts and refuse to call
-    // fs::remove_all if anything is still mounted under sandbox. MNT_DETACH
-    // should make this impossible, but if a mount ever survived we must
-    // NOT walk into it - that path once deleted host /usr/lib via orphaned
-    // bind mounts.
-    mounts_f = setmntent("/proc/mounts", "r");
-    if (!mounts_f)
-        fatal_errno("cannot open /proc/mounts");
-    while (auto mounts = getmntent(mounts_f)) {
-        if (mount_is_under_sandbox(mounts->mnt_dir)) {
-            endmntent(mounts_f);
-            fatal(std::string("refusing to remove sandbox - live mount under it: ") + mounts->mnt_dir);
-        }
-    }
-    endmntent(mounts_f);
-
-    std::error_code ec;
-    fs::remove_all(sandbox, ec);
-    if (ec)
-        fatal("cannot remove sandbox: " + ec.message());
+    struct stat st;
+    if (fstat(sandbox_fd, &st))
+        fatal_errno("cannot stat the sandbox folder");
+    empty_tree(sandbox_fd);
+    close(sandbox_fd);
+    sandbox_fd = -1;
+    remove_leaf(st);
 }
 
 void clean() {
+    // The child's fatal_* exits run atexit too; the parent cleans up after it
+    if (is_child)
+        return;
+
     // Guard against re-entry: the atexit handler calls clean(), and any
-    // fatal_* inside remove_sandbox_path() would exit() and trigger
+    // fatal_* inside remove_sandbox() would exit() and trigger
     // atexit -> clean() -> ... again. One attempt is enough.
     static bool entered = false;
     if (entered)
         return;
     entered = true;
+
+    // An open clone keeps the tree's mount points busy
+    if (tree_fd >= 0) {
+        close(tree_fd);
+        tree_fd = -1;
+    }
 
     // Remove cgroups
     if (sandbox_cgroup != nullptr) {
@@ -429,28 +600,11 @@ void clean() {
         cgroup_free(&sandbox_cgroup);
     }
 
-    remove_sandbox_path();
-}
-
-void init_dirs() {
-    kill_all_sandbox_processes();
-    remove_sandbox_path();
-
-    std::array<std::string, 5> dirs = {"dev", "etc", "proc", "root", "tmp"};
-
-    std::error_code ec;
-    for (auto &dir: dirs) {
-        fs::create_directories(sandbox / dir, ec);
-        if (ec)
-            fatal("cannot create system dir: " + ec.message());
-    }
-
-    if (chmod((sandbox / "tmp").c_str(), 0777))
-        fatal_errno("cannot set mode 777 for /tmp");
+    remove_sandbox();
 }
 
 // Create minimal device nodes instead of full devtmpfs (fix: devtmpfs exposes all devices)
-void create_dev_nodes() {
+void create_dev_nodes(int dev_fd) {
     struct dev_node {
         const char *name;
         mode_t mode;
@@ -468,20 +622,59 @@ void create_dev_nodes() {
 
     mode_t old_umask = umask(0);
     for (const auto &d : devices) {
-        auto path = sandbox / "dev" / d.name;
-        if (mknod(path.c_str(), d.mode, makedev(d.major, d.minor)))
+        if (mknodat(dev_fd, d.name, d.mode, makedev(d.major, d.minor)))
             if (errno != EEXIST)
                 fatal_errno(std::string("cannot create device ") + d.name);
     }
     umask(old_umask);
 }
 
-void libs_deps(fs::path &bin, std::vector<std::string> &res) {
-    std::string bin_str = bin.string();
+// Makes the sandbox's own folders and device nodes. /tmp stays 0755 until everything is in place.
+void init_dirs() {
+    for (const char *name: {"dev", "etc", "proc", "root", "tmp"}) {
+        if (mkdirat(sandbox_fd, name, 0755))
+            fatal_errno(std::string("cannot create system dir ") + name);
+        int fd = open_child_dir(sandbox_fd, name);
+        if (fd < 0 || fchmod(fd, 0755))
+            fatal_errno(std::string("cannot open system dir ") + name);
+        if (strcmp(name, "dev") == 0)
+            create_dev_nodes(fd);
+        if (strcmp(name, "tmp") == 0)
+            tmp_fd = fd;
+        else
+            close(fd);
+    }
+}
+
+// Opens the folder rel inside the sandbox one component at a time, making the missing ones with create.
+// A link, a file or a mount on the way is refused, so nothing outside the sandbox is ever reached.
+static int open_beneath(const fs::path &rel, bool create) {
+    int fd = fcntl(sandbox_fd, F_DUPFD_CLOEXEC, 0);
+    if (fd < 0)
+        fatal_errno("cannot open the sandbox folder");
+    for (const auto &part: rel) {
+        auto name = part.string();
+        if (name.empty() || name == ".")
+            continue;
+        if (create && mkdirat(fd, name.c_str(), 0755) && errno != EEXIST)
+            fatal_errno("cannot create " + rel.string() + " in the sandbox");
+        int next = open_child_dir(fd, name.c_str());
+        if (next < 0) {
+            if (errno == ELOOP || errno == ENOTDIR || errno == EXDEV)
+                fatal("refusing " + rel.string() + " in the sandbox: a link, a file or a mount is in the way");
+            fatal_errno("cannot open " + rel.string() + " in the sandbox");
+        }
+        close(fd);
+        fd = next;
+    }
+    return fd;
+}
+
+void libs_deps(const std::string &bin, std::vector<std::string> &res) {
     std::vector<const char *> args = {
-        "/usr/bin/ldd", bin_str.c_str(), nullptr
+        "/usr/bin/ldd", bin.c_str(), nullptr
     };
-    std::string out_buf = exec_command("/usr/bin/ldd", args);
+    std::string out_buf = exec_as_caller("/usr/bin/ldd", args);
 
     static const std::regex re(R"((?:.+?\s+=>)?\s+(/.+?)\s+\(.+?\))");
 
@@ -495,65 +688,105 @@ void libs_deps(fs::path &bin, std::vector<std::string> &res) {
     }
 }
 
-// Use realpath for atomic symlink resolution (fix: TOCTOU race)
-void create_hardlink(const fs::path &src, const fs::path &dst) {
-    std::error_code ec;
-
-    char *resolved = realpath(src.c_str(), nullptr);
-    if (!resolved)
-        fatal_errno("cannot resolve path: " + src.string());
-    fs::path real_path(resolved);
-    free(resolved);
-
-    fs::create_directories(dst.parent_path(), ec);
-    if (ec)
-        fatal("cannot create directory for hard link: " + ec.message());
-
-    fs::create_hard_link(real_path, dst, ec);
-    if (ec) {
-        if (ec == std::errc::file_exists)
-            return;
-
-        if (ec == std::errc::cross_device_link) {
-            ec.clear();
-            fs::copy_file(real_path, dst, ec);
-            if (ec)
-                fatal("cannot copy file " + real_path.string() + "->" + dst.string() + ": " + ec.message());
-            return;
-        }
-
-        fatal("cannot create hardlink " + real_path.string() + "->" + dst.string() + ": " + ec.message());
+// Copies the regular file src, a /proc/self/fd link, to name in dir_fd, as root, with its mode but no
+// set-ID bits
+static void copy_file_into(const std::string &src, const struct stat &st, int dir_fd, const std::string &name) {
+    int in = open(src.c_str(), O_RDONLY | O_CLOEXEC);
+    if (in < 0)
+        fatal_errno("cannot read file to copy " + name);
+    int out = openat(dir_fd, name.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (out < 0) {
+        if (errno != EEXIST)
+            fatal_errno("cannot copy file to " + name);
+        close(in);
+        return;
     }
+
+    char buf[65536];
+    ssize_t n;
+    while ((n = read(in, buf, sizeof(buf))) > 0) {
+        for (ssize_t done = 0; done < n;) {
+            ssize_t w = write(out, buf + done, n - done);
+            if (w < 0)
+                fatal_errno("cannot copy file to " + name);
+            done += w;
+        }
+    }
+    if (n < 0 || fchmod(out, st.st_mode & 0777))
+        fatal_errno("cannot copy file to " + name);
+    close(out);
+    close(in);
 }
 
-void add_file(const fs::path &src, const fs::path &dst, bool with_deps) {
-    validate_path_in_sandbox(dst, "add_file destination");
-    auto sbox_path = sandbox / dst.relative_path();
+// Puts the host file src, opened with the caller's rights, at dst in the sandbox: a hard link, or a copy
+// across filesystems
+static void place_file(const std::string &src, const fs::path &dst) {
+    drop_privileges("--add_file");
+    int src_fd = open(src.c_str(), O_PATH | O_CLOEXEC);
+    int open_errno = errno;
+    restore_privileges();
+    if (src_fd < 0) {
+        errno = open_errno;
+        fatal_errno("cannot resolve path: " + src);
+    }
+    struct stat st;
+    if (fstat(src_fd, &st))
+        fatal_errno("cannot stat " + src);
+    if (!S_ISREG(st.st_mode))
+        fatal("add_file source must be a regular file: " + src);
 
-    create_hardlink(src, sbox_path);
+    auto name = dst.filename().string();
+    if (name.empty() || name == ".")
+        fatal("add_file destination must name a file: " + dst.string());
+    int dir_fd = open_beneath(dst.parent_path().relative_path(), true);
+
+    auto src_link = "/proc/self/fd/" + std::to_string(src_fd);
+    if (linkat(AT_FDCWD, src_link.c_str(), dir_fd, name.c_str(), AT_SYMLINK_FOLLOW) && errno != EEXIST) {
+        if (errno != EXDEV)
+            fatal_errno("cannot create hardlink " + src + "->" + dst.string());
+        copy_file_into(src_link, st, dir_fd, name);
+    }
+    close(dir_fd);
+    close(src_fd);
+}
+
+void add_file(const std::string &src, const fs::path &dst, bool with_deps) {
+    place_file(src, dst);
 
     if (with_deps) {
+        // ldd runs the loader on the binary, so it runs as the caller, on the host's file
         std::vector<std::string> libs;
-        libs_deps(sbox_path, libs);
+        libs_deps(src, libs);
 
         for (auto &l: libs) {
-            create_hardlink(l, sandbox / fs::path(l).relative_path());
+            validate_path_in_sandbox(l, "add_elf_file library");
+            place_file(l, fs::path(l).lexically_normal());
         }
     }
 }
 
-void mount_dir(const fs::path &src, const fs::path &dst) {
-    validate_path_in_sandbox(dst, "mount destination");
-    auto sbox_path = sandbox / dst.relative_path();
+void mount_dir(const std::string &src, const fs::path &dst) {
+    auto rel = dst.relative_path();
+    if (rel.empty())
+        fatal("mount destination must not be the sandbox root");
 
-    std::error_code ec;
-    fs::create_directories(sbox_path, ec);
-    if (ec)
-        fatal("cannot create target mount directory: " + ec.message());
+    drop_privileges("--mount_dir");
+    int src_fd = open(src.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
+    int open_errno = errno;
+    restore_privileges();
+    if (src_fd < 0) {
+        errno = open_errno;
+        fatal_errno("cannot mount dir " + src);
+    }
 
-    if (mount(src.c_str(), sbox_path.c_str(), "", MS_BIND, nullptr))
+    int dst_fd = open_beneath(rel, true);
+    auto from = "/proc/self/fd/" + std::to_string(src_fd);
+    auto to = "/proc/self/fd/" + std::to_string(dst_fd);
+    if (mount(from.c_str(), to.c_str(), "", MS_BIND, nullptr))
         if (errno != EBUSY)
-            fatal_errno("cannot mount dir " + src.string());
+            fatal_errno("cannot mount dir " + src);
+    close(dst_fd);
+    close(src_fd);
 }
 
 cgroup *create_cgroup(const std::string &name, const std::string &cpu_set, const std::string &cpu_max,
@@ -669,22 +902,22 @@ static int _execute(void *arg) {
     if (mount("", "/", "", MS_PRIVATE | MS_REC, nullptr))
         fatal_errno("cannot make mounts private");
 
-    if (mount(sandbox.c_str(), sandbox.c_str(), "", MS_BIND | MS_REC, nullptr))
-        fatal_errno("cannot bind mount sandbox");
+    // The parent cloned the sandbox tree through its fd: attach the clone and make it the root, so no
+    // path is looked up by name
+    if (syscall(__NR_move_mount, tree_fd, "", AT_FDCWD, "/", MOVE_MOUNT_F_EMPTY_PATH))
+        fatal_errno("cannot attach the sandbox tree");
 
-    auto put_old_path = sandbox / ".put_old";
-    mkdir(put_old_path.c_str(), 0700);
+    if (fchdir(tree_fd))
+        fatal_errno("cannot chdir");
 
-    if (syscall(SYS_pivot_root, sandbox.c_str(), put_old_path.c_str()))
+    if (syscall(SYS_pivot_root, ".", "."))
         fatal_errno("cannot pivot_root");
+
+    if (umount2(".", MNT_DETACH))
+        fatal_errno("cannot unmount old root");
 
     if (chdir("/"))
         fatal_errno("cannot chdir");
-
-    if (umount2("/.put_old", MNT_DETACH))
-        fatal_errno("cannot unmount old root");
-
-    rmdir("/.put_old");
 
     if (mount("proc", "/proc", "proc", 0, "subset=pid,hidepid=2"))
         if (errno != EBUSY)
@@ -844,21 +1077,15 @@ int execute(const fs::path &bin, const std::vector<char *> &args, const std::vec
             const uint64_t mem_limit, const bool no_swap, const bool oom_group, const std::string &usage_stat_file,
             const fs::path &exec_dir, const uid_t uid, const uint64_t tmp_size, const int stop_fifo) {
 
-    if (mem_limit && cgroup_name.empty())
-        fatal("cannot set memory limit without cgroup name");
-
-    if (no_swap && !mem_limit)
-        fatal("cannot forbid swap without memory limit");
-
-    if (oom_group && !mem_limit)
-        fatal("cannot group OOM kills without memory limit");
-
-    if (!cpu_max.empty() && cgroup_name.empty())
-        fatal("cannot set cpu.max without cgroup name");
-
     std::string tmp_mount_opts;
     if (tmp_size)
         tmp_mount_opts = "size=" + std::to_string(tmp_size) + ",mode=1777";
+
+    // Everything is in place: only now may others write /tmp, which stays 0755 under a tmpfs
+    if (!tmp_size && fchmod(tmp_fd, 0777))
+        fatal_errno("cannot set mode 777 for /tmp");
+    close(tmp_fd);
+    tmp_fd = -1;
 
     exe_opts opts{bin, args, env, exec_dir, uid, tmp_mount_opts};
 
@@ -890,9 +1117,6 @@ int execute(const fs::path &bin, const std::vector<char *> &args, const std::vec
             fatal_errno("cannot open cgroup as fd for CLONE_INTO_CGROUP");
     }
 
-    // Create minimal device nodes before clone (fix: devtmpfs exposes all devices)
-    create_dev_nodes();
-
     // SIGCHLD wakes the wait for the child through a pipe, so no exit is missed between checks
     int wake_pipe[2];
     if (pipe2(wake_pipe, O_CLOEXEC | O_NONBLOCK))
@@ -916,16 +1140,25 @@ int execute(const fs::path &bin, const std::vector<char *> &args, const std::vec
         cl_args.cgroup = static_cast<uint64_t>(cgroup_fd);
     }
 
+    // The child's root is a clone of the tree reached through sandbox_fd, with its mounts
+    tree_fd = static_cast<int>(syscall(__NR_open_tree, sandbox_fd, "",
+                                       OPEN_TREE_CLONE | AT_RECURSIVE | AT_EMPTY_PATH | OPEN_TREE_CLOEXEC));
+    if (tree_fd < 0)
+        fatal_errno("cannot clone the sandbox tree");
+
     pid = syscall(SYS_clone3, &cl_args, sizeof(cl_args));
     if (pid == -1)
         fatal_errno("clone3 failed");
     if (pid == 0) {
         // Child - never returns; either execs or _exit's
+        is_child = true;
         _exit(_execute(&opts));
     }
 
     if (cgroup_fd >= 0)
         close(cgroup_fd);
+    close(tree_fd);
+    tree_fd = -1;
 
     // Now safe to delegate cgroup.kill to the caller. The parent is NOT in
     // the per-run cgroup, so writing "1" to cgroup.kill from outside will
@@ -956,15 +1189,18 @@ int execute(const fs::path &bin, const std::vector<char *> &args, const std::vec
 void print_usage() {
     std::cout << R"(Usage:
     sandbox <sandbox path> [args] -- <cmd to execute> [cmd args]
+
+    The sandbox path's parent must be the caller's own folder, or a root-owned sticky folder that everyone
+    may write, such as /tmp. Files are put in place before folders are mounted.
 args:
     --add_file <src host path> <dst sandbox path>
-        Copy a file from a host system to a sandbox
+        Copy a regular file from a host system to a sandbox
 
     --add_elf_file <src host path> <dst sandbox path>
         Copy an ELF file from a host system to a sandbox with needed libraries
 
     --mount_dir <src host path> <dst sandbox path>
-        Mount a directory from a host system to a sandbox
+        Mount a directory from a host system to a sandbox, not under another mount
 
     --env <value>
         Environ variables
@@ -1005,7 +1241,7 @@ args:
 
     --stop_fifo <path>
         Stop the command when a byte is read from this FIFO, which the caller makes and owns and which its
-        group and others cannot write; EOF does not stop
+        group and others can neither read nor write; EOF does not stop
 
     --stop_grace <seconds>
         Stop with SIGTERM, then SIGKILL after this many seconds (1-3600, default 30 with --stop_fifo);
@@ -1045,6 +1281,8 @@ int main(int argc, char *argv[]) {
         print_usage();
 
     sandbox = fs::path(argv[1]).lexically_normal();
+    if (!sandbox.has_filename())
+        sandbox = sandbox.parent_path();
 
     // Validate sandbox path (fix: unvalidated sandbox path)
     validate_sandbox_path(sandbox);
@@ -1057,7 +1295,7 @@ int main(int argc, char *argv[]) {
             clean();
     });
 
-    // Install signal handlers before init_dirs so a SIGTERM during setup
+    // Install signal handlers before the setup so a SIGTERM during it
     // does not kill us via the default terminate disposition (which skips
     // atexit and leaks mounts). The handler sets got_signal and the normal
     // flow reaches atexit on return from execute() / print_usage().
@@ -1067,30 +1305,6 @@ int main(int argc, char *argv[]) {
     sa.sa_flags = 0; // No SA_RESTART so waitpid gets EINTR
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
-
-    // Give the parent its OWN mount namespace before any --mount_dir bind (the
-    // arg loop below creates them). Binds then exist only in this private
-    // namespace and are torn down by the kernel the instant the process dies -
-    // including SIGKILL, which bypasses atexit()/clean(). This is the
-    // root-cause fix for the host /usr/lib wipe: even if the orchestrator
-    // SIGKILLs us (ctx cancel) mid-compile, the /usr/lib /lib /usr/libexec
-    // /usr/include binds never exist in the host namespace, so a later
-    // os.RemoveAll of the build dir cannot cross a leaked bind into the real
-    // host tree.
-    if (unshare(CLONE_NEWNS))
-        fatal_errno("cannot unshare mount namespace");
-
-    // MS_REC|MS_PRIVATE is load-bearing: the host '/' is MS_SHARED on systemd
-    // systems, so without this our binds would propagate back into the host's
-    // peer group and re-leak. Mirrors the child-side make-private at _execute().
-    if (mount("", "/", "", MS_REC | MS_PRIVATE, nullptr))
-        fatal_errno("cannot make mounts private in new namespace");
-
-    init_dirs();
-
-    // link sandbox manager process with sandbox path
-    if (!fopen(sandbox.c_str(), "r"))
-        fatal_errno("cannot open sandbox path");
 
     fs::path cmd, exec_dir;
     std::string cgroup, cpu_set, cpu_max, usage_stat_file;
@@ -1103,6 +1317,15 @@ int main(int argc, char *argv[]) {
     std::vector<char *> cmd_args = {nullptr}; // reserved for cmd path
     std::vector<char *> cmd_env;
     int ignored_flags = 0;
+    struct file_arg {
+        std::string src;
+        fs::path dst;
+        bool elf;
+    };
+    std::vector<file_arg> files;
+    std::vector<std::pair<std::string, fs::path>> mounts;
+
+    // All arguments are checked before anything is made, so --uid reads /etc before any mount
 
     auto i = 2;
     while (i < argc) {
@@ -1119,7 +1342,9 @@ int main(int argc, char *argv[]) {
             if (i + 3 > argc || strncmp(argv[i + 1], "--", 2) == 0 || strncmp(argv[i + 2], "--", 2) == 0)
                 print_usage();
 
-            add_file(argv[i + 1], argv[i + 2], strcmp(argv[i], "--add_elf_file") == 0);
+            validate_path_in_sandbox(argv[i + 2], "add_file destination");
+            files.push_back({argv[i + 1], fs::path(argv[i + 2]).lexically_normal(),
+                             strcmp(argv[i], "--add_elf_file") == 0});
 
             i += 3;
 
@@ -1127,7 +1352,8 @@ int main(int argc, char *argv[]) {
             if (i + 3 > argc || strncmp(argv[i + 1], "--", 2) == 0 || strncmp(argv[i + 2], "--", 2) == 0)
                 print_usage();
 
-            mount_dir(argv[i + 1], argv[i + 2]);
+            validate_path_in_sandbox(argv[i + 2], "mount destination");
+            mounts.emplace_back(argv[i + 1], fs::path(argv[i + 2]).lexically_normal());
 
             i += 3;
 
@@ -1249,6 +1475,46 @@ int main(int argc, char *argv[]) {
 
     if (stop_fifo >= 0 && !stop_grace)
         stop_grace = DEFAULT_STOP_GRACE;
+
+    if (mem_limit && cgroup.empty())
+        fatal("cannot set memory limit without cgroup name");
+
+    if (no_swap && !mem_limit)
+        fatal("cannot forbid swap without memory limit");
+
+    if (oom_group && !mem_limit)
+        fatal("cannot group OOM kills without memory limit");
+
+    if (!cpu_max.empty() && cgroup.empty())
+        fatal("cannot set cpu.max without cgroup name");
+
+    // Give the parent its OWN mount namespace before any --mount_dir bind (made
+    // below). Binds then exist only in this private namespace and are torn
+    // down by the kernel the instant the process dies -
+    // including SIGKILL, which bypasses atexit()/clean(). This is the
+    // root-cause fix for the host /usr/lib wipe: even if the orchestrator
+    // SIGKILLs us (ctx cancel) mid-compile, the /usr/lib /lib /usr/libexec
+    // /usr/include binds never exist in the host namespace, so a later
+    // os.RemoveAll of the build dir cannot cross a leaked bind into the real
+    // host tree.
+    if (unshare(CLONE_NEWNS))
+        fatal_errno("cannot unshare mount namespace");
+
+    // MS_REC|MS_PRIVATE is load-bearing: the host '/' is MS_SHARED on systemd
+    // systems, so without this our binds would propagate back into the host's
+    // peer group and re-leak. Mirrors the child-side make-private at _execute().
+    if (mount("", "/", "", MS_REC | MS_PRIVATE, nullptr))
+        fatal_errno("cannot make mounts private in new namespace");
+
+    open_parent();
+    make_sandbox();
+    init_dirs();
+
+    // Files first: a file is never put through a mount into a host folder
+    for (const auto &f: files)
+        add_file(f.src, f.dst, f.elf);
+    for (const auto &m: mounts)
+        mount_dir(m.first, m.second);
 
     int flags = CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWPID | CLONE_NEWCGROUP | SIGCHLD;
     if ((ignored_flags & CLONE_NEWNET) == 0)

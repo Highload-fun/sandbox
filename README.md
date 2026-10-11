@@ -35,15 +35,15 @@ debuild -b
 sudo sandbox <sandbox_path> [options] -- <cmd> [cmd_args]
 ```
 
-The `<sandbox_path>` is a temporary directory created by the tool to serve as the chroot filesystem. It is cleaned up automatically on exit.
+The `<sandbox_path>` is a temporary directory created by the tool to serve as the chroot filesystem. It is cleaned up automatically on exit. See [Sandbox path](#sandbox-path) for the folders it may live in.
 
 ### Options
 
 | Option | Description |
 |---|---|
-| `--add_file <src> <dst>` | Copy a file from the host into the sandbox |
+| `--add_file <src> <dst>` | Put a regular file from the host into the sandbox: a hard link, or a copy without set-ID bits across filesystems |
 | `--add_elf_file <src> <dst>` | Copy an ELF binary and its shared library dependencies |
-| `--mount_dir <src> <dst>` | Bind-mount a host directory into the sandbox |
+| `--mount_dir <src> <dst>` | Bind-mount a host directory into the sandbox, not under another mount and not at its root |
 | `--env <value>` | Set an environment variable (e.g. `--env PATH=/usr/bin`) |
 | `--no_new_net` | Share the host network namespace instead of isolating |
 | `--cgroup <name>` | Run the process in a named cgroup |
@@ -83,12 +83,20 @@ sudo sandbox /tmp/sbox \
 
 ## How it works
 
-1. Creates a minimal filesystem at the sandbox path (`/dev`, `/etc`, `/proc`, `/root`, `/tmp`)
-2. Copies requested files/libraries and sets up bind mounts
+1. Checks every argument, then creates a minimal filesystem at the sandbox path (`/dev`, `/etc`, `/proc`, `/root`, `/tmp`)
+2. Puts in the requested files and libraries, then sets up the bind mounts
 3. Optionally creates a cgroup with CPU and memory constraints
 4. Clones a child process with isolated namespaces (`CLONE_NEWNS`, `CLONE_NEWPID`, `CLONE_NEWNET`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWCGROUP`)
-5. Inside the child: chroots, mounts `/dev` and `/proc`, drops privileges to nobody (UID 65534) or the `--uid` one, then exec's the target binary
+5. Inside the child: makes a clone of the sandbox tree its root with `pivot_root`, mounts `/proc`, drops privileges to nobody (UID 65534) or the `--uid` one, then exec's the target binary
 6. On exit, unmounts all filesystems and removes the sandbox directory
+
+## Sandbox path
+
+The sandbox path's parent must be the caller's own folder, or a root-owned sticky folder that everyone may write, such as `/tmp`; a root caller may use any. The tool opens the parent with the caller's rights, so a link on the way leads only where the caller could go.
+
+A folder already at the sandbox path, left by an earlier run, is removed first. It must be the caller's, or root's in the caller's own parent; in a shared parent such as `/tmp` a root-owned folder may be anyone's, so the tool refuses it. A link at the sandbox path is refused.
+
+The tool builds and removes the tree through file descriptors, never by its path: it follows no link inside the tree, enters no mount when it removes it, and a rename of the folder during a run redirects nothing. `/tmp` in the tree becomes writable by others only once everything is in place. `ldd` runs as the caller, on the host's file.
 
 ## Own UID
 
@@ -103,7 +111,7 @@ A root caller cannot use `--uid`. Every refusal prints a fixed message and exits
 
 ## Graceful stop
 
-`--stop_fifo <path>` names a FIFO that the caller makes, owns, and that neither its group nor others can write. The tool never creates or changes it: it opens it with the caller's rights, without following a symlink, and refuses anything else. Writing a byte to it stops the command; a writer that closes without writing does not.
+`--stop_fifo <path>` names a FIFO that the caller makes, owns, and that neither its group nor others can read or write. The tool never creates or changes it: it opens it with the caller's rights, without following a symlink, and refuses anything else. Writing a byte to it stops the command; a writer that closes without writing does not.
 
 A stop sends SIGTERM to the command and SIGKILL once the `--stop_grace` seconds have passed. With `--stop_fifo` or `--stop_grace`, SIGTERM and SIGINT sent to the tool stop the command the same way; without them they kill it at once, and the tool exits 1. After a stop the tool exits with the command's own code, or 137 when the grace ran out.
 
