@@ -24,6 +24,8 @@ sandbox (2.4.0-1) unstable; urgency=medium
     caller, one the tool made for that caller
   * claim a new cgroup with mkdir before writing into it, so two runs naming
     it at once cannot share it
+  * add --fsize_max: limit every file the command writes, stdout and stderr
+    included, with RLIMIT_FSIZE; past it a write fails with EFBIG
 
  -- Sergey Svistunov <sergey-svistunov@yandex.ru>  Sun, 11 Oct 2026 17:15:00 +0000
 

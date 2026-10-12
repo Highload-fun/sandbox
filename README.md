@@ -58,6 +58,7 @@ The `<sandbox_path>` is a temporary directory created by the tool to serve as th
 | `--tmp_size <bytes>` | Mount a `nosuid,nodev` tmpfs of this size, mode 1777, at `/tmp` (default: an on-disk folder) |
 | `--stop_fifo <path>` | Stop the command when a byte is read from this FIFO (see [Graceful stop](#graceful-stop)) |
 | `--stop_grace <seconds>` | Stop with SIGTERM, then SIGKILL after this many seconds, 1-3600 (default 30 with `--stop_fifo`) |
+| `--fsize_max <bytes>` | Limit every file the command writes, stdout and stderr included, to this size, up to 1 TiB (see [File size limit](#file-size-limit)) |
 | `--version` | Print the version and exit |
 
 ### Examples
@@ -126,6 +127,10 @@ echo 1 > /sys/fs/cgroup/my_sandbox/cgroup.kill
 ```
 
 This is the only reliable way to kill sandbox processes externally — the sandbox parent runs as root and children run as nobody, so sending signals from a non-root caller would fail with EPERM. Writing to `cgroup.kill` is a kernel-level operation that atomically kills all processes in the cgroup regardless of their UIDs.
+
+## File size limit
+
+`--fsize_max <bytes>` sets `RLIMIT_FSIZE`, soft and hard, on the command just before it starts, so it applies to every file the command or its children write, including a host file passed as stdout or stderr, and to a write at any offset. The tool's own copies for `--add_file` are made before and are not limited. SIGXFSZ is ignored, so a write past the limit fails with `EFBIG` and the command goes on; a Go program installs its own SIGXFSZ handler, which ignores it too, so its write returns "file too large". The limit is never set above the one the command would have had, and nothing in the sandbox can raise it.
 
 ## Existing cgroups
 

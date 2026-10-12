@@ -331,6 +331,47 @@ int main(int argc, char **argv) {
 }
 C
 
+    # fsizetest: in a child process, as PID 1 drops SIGXFSZ anyway, fills a file and stdout up to N bytes
+    # and writes at offset N, reporting each result on stderr
+    cat > "$HELPERS_DIR/fsizetest.c" << 'C'
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+static void fill(const char *what, int fd, long max) {
+    static char buf[4096];
+    long total = 0;
+    ssize_t n = 0;
+    while (total < max && (n = write(fd, buf, sizeof(buf))) > 0)
+        total += n;
+    fprintf(stderr, "%s: wrote %ld, then %s\n", what, total, n < 0 ? strerror(errno) : "no error");
+}
+int main(int argc, char **argv) {
+    long max = atol(argv[2]);
+    pid_t pid = fork();
+    if (pid == 0) {
+        int fd = open(argv[1], O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd < 0) { perror("open"); return 1; }
+        fill("file", fd, max);
+        fprintf(stderr, "pwrite past the cap: %s\n", pwrite(fd, "x", 1, max) < 0 ? strerror(errno) : "written");
+        struct stat st;
+        fstat(fd, &st);
+        fprintf(stderr, "file size: %lld\n", (long long)st.st_size);
+        fill("stdout", 1, max);
+        return 0;
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    if (WIFSIGNALED(status))
+        fprintf(stderr, "writer killed by signal %d\n", WTERMSIG(status));
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+C
+
     gcc -static -o "$HELPERS_DIR/memhog"    "$HELPERS_DIR/memhog.c"
     gcc -static -o "$HELPERS_DIR/forkhog"   "$HELPERS_DIR/forkhog.c"
     gcc -static -o "$HELPERS_DIR/sleeper"   "$HELPERS_DIR/sleeper.c"
@@ -340,6 +381,7 @@ C
     gcc -static -o "$HELPERS_DIR/privcheck" "$HELPERS_DIR/privcheck.c"
     gcc -static -o "$HELPERS_DIR/stubborn"  "$HELPERS_DIR/stubborn.c"
     gcc -static -o "$HELPERS_DIR/deeptree"  "$HELPERS_DIR/deeptree.c"
+    gcc -static -o "$HELPERS_DIR/fsizetest" "$HELPERS_DIR/fsizetest.c"
 }
 
 # ================================================================
@@ -1485,6 +1527,50 @@ test_mount_rules() {
         sbox mountroot "${echo_args[@]}" --mount_dir "$a" / -- /bin/echo ran
 }
 
+test_fsize_max() {
+    echo "[fsize_max]"
+
+    local cap=1048576 out="$TEST_DIR/fsize_out.txt" err="$TEST_DIR/fsize_err.txt" report size rc=0
+    local echo_args=(--add_elf_file /bin/echo /bin/echo)
+    sbox fsize \
+        --add_file "$HELPERS_DIR/fsizetest" /bin/fsizetest \
+        --fsize_max $cap \
+        -- /bin/fsizetest /tmp/big $((cap * 4)) >"$out" 2>"$err" || rc=$?
+    report=$(cat "$err")
+    assert_exit 0 $rc "a command writing past the cap ends normally"
+    assert_output_contains "$report" "^file: wrote $cap, then File too large$" "a write past the cap fails with EFBIG"
+    assert_output_contains "$report" "^pwrite past the cap: File too large$" "a pwrite past the cap fails"
+    assert_output_contains "$report" "^file size: $cap$" "the file stops at the cap"
+    assert_output_contains "$report" "^stdout: wrote $cap, then File too large$" "stdout, a host file, stops at the cap"
+    assert_output_not_contains "$report" "killed by signal" "SIGXFSZ kills no process"
+    size=$(stat -c %s "$out")
+    if [ "$size" -le "$cap" ]; then
+        pass "the host file behind stdout is no larger than the cap"
+    else
+        fail "the host file behind stdout is no larger than the cap" "it holds $size bytes"
+    fi
+
+    # The tool's own copy of a larger file, across filesystems, is not limited
+    local big="/dev/shm/sandbox_test_big_$$"
+    head -c $((cap * 2)) /dev/zero > "$big"
+    rc=0
+    out=$(sbox fsizecopy \
+        --add_elf_file /usr/bin/stat /usr/bin/stat \
+        --add_file "$big" /big \
+        --fsize_max $cap \
+        -- /usr/bin/stat -c %s /big 2>&1) || rc=$?
+    rm -f "$big"
+    assert_exit 0 $rc "stat runs on the tool's own copy"
+    assert_output_contains "$out" "^$((cap * 2))$" "the tool's own copy of a larger file is whole"
+
+    assert_refused "--fsize_max given twice" "^--fsize_max is given twice$" \
+        sbox fsizetwice "${echo_args[@]}" --fsize_max $cap --fsize_max $cap -- /bin/echo ran
+    assert_refused "--fsize_max 0" "^--fsize_max must be 1-1099511627776 bytes$" \
+        sbox fsizezero "${echo_args[@]}" --fsize_max 0 -- /bin/echo ran
+    assert_refused "--fsize_max above 1 TiB" "^--fsize_max must be 1-1099511627776 bytes$" \
+        sbox fsizehuge "${echo_args[@]}" --fsize_max 1099511627777 -- /bin/echo ran
+}
+
 test_deep_tree() {
     echo "[deep tree]"
 
@@ -1669,6 +1755,7 @@ main() {
     test_copy_drops_setid
     test_foreign_setid_copied
     test_link_during_placement
+    test_fsize_max
     test_deep_tree
     test_deep_mounts
 

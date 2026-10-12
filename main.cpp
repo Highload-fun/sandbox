@@ -24,6 +24,7 @@
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <fcntl.h>
 #include <dirent.h>
 #include <grp.h>            // setgroups
@@ -77,6 +78,8 @@
 #define UID_RANGE_MAX 2000999999ULL
 #define DEFAULT_STOP_GRACE 30
 #define MAX_STOP_GRACE 3600
+// --fsize_max takes at most 1 TiB
+#define MAX_FSIZE (1ULL << 40)
 // The removal walk keeps at most this many folders open; a deeper subtree is moved up
 #define MAX_WALK_DEPTH 256
 #define MAX_HOISTS UINT32_MAX
@@ -92,6 +95,7 @@ struct exe_opts {
     const fs::path &exec_dir;
     const uid_t uid;
     const std::string &tmp_mount_opts;
+    const uint64_t fsize_max;
 };
 
 static volatile sig_atomic_t got_signal = 0;
@@ -1063,6 +1067,18 @@ static int _execute(void *arg) {
 
     install_seccomp_filter();
 
+    // No file the command writes, stdout and stderr included, grows past --fsize_max: a write there fails
+    // with EFBIG, as SIGXFSZ is ignored rather than ending the command. The limit is never above the one
+    // the command would have had, and nothing in the sandbox can raise it.
+    if (opts->fsize_max) {
+        struct rlimit fsize;
+        if (getrlimit(RLIMIT_FSIZE, &fsize))
+            fatal_errno("cannot limit file size");
+        fsize.rlim_cur = fsize.rlim_max = std::min<rlim_t>(opts->fsize_max, fsize.rlim_max);
+        if (setrlimit(RLIMIT_FSIZE, &fsize) || signal(SIGXFSZ, SIG_IGN) == SIG_ERR)
+            fatal_errno("cannot limit file size");
+    }
+
     // Close leaked file descriptors (fix: FD leak into sandbox)
     syscall(SYS_close_range, 3, ~0U, 0);
 
@@ -1178,7 +1194,8 @@ int wait_child(int wake_read_fd, int stop_fifo) {
 int execute(const fs::path &bin, const std::vector<char *> &args, const std::vector<char *> &env, const int flags,
             const std::string &cgroup_name, const std::string &cpu_set, const std::string &cpu_max,
             const uint64_t mem_limit, const bool no_swap, const bool oom_group, const std::string &usage_stat_file,
-            const fs::path &exec_dir, const uid_t uid, const uint64_t tmp_size, const int stop_fifo) {
+            const fs::path &exec_dir, const uid_t uid, const uint64_t tmp_size, const int stop_fifo,
+            const uint64_t fsize_max) {
 
     std::string tmp_mount_opts;
     if (tmp_size)
@@ -1191,7 +1208,7 @@ int execute(const fs::path &bin, const std::vector<char *> &args, const std::vec
     close(tmp_fd);
     tmp_fd = -1;
 
-    exe_opts opts{bin, args, env, exec_dir, uid, tmp_mount_opts};
+    exe_opts opts{bin, args, env, exec_dir, uid, tmp_mount_opts, fsize_max};
 
     int cgroup_fd = -1;
     if (!cgroup_name.empty()) {
@@ -1356,6 +1373,10 @@ args:
         Stop with SIGTERM, then SIGKILL after this many seconds (1-3600, default 30 with --stop_fifo);
         SIGTERM and SIGINT to sandbox stop the same way
 
+    --fsize_max <bytes>
+        Limit every file the command writes, its stdout and stderr included, to this size (up to 1 TiB);
+        past it a write fails with EFBIG
+
     --version
         Print the version
 )" << std::endl;
@@ -1419,6 +1440,7 @@ int main(int argc, char *argv[]) {
     std::string cgroup, cpu_set, cpu_max, usage_stat_file;
     uint64_t mem_limit = 0;
     uint64_t tmp_size = 0;
+    uint64_t fsize_max = 0;
     uid_t uid = NOBODY_UID;
     int stop_fifo = -1;
     bool no_swap = false;
@@ -1577,6 +1599,17 @@ int main(int argc, char *argv[]) {
 
             i += 2;
 
+        } else if (strcmp(argv[i], "--fsize_max") == 0) {
+            if (i + 2 > argc || strncmp(argv[i + 1], "--", 2) == 0)
+                print_usage();
+
+            if (fsize_max)
+                fatal("--fsize_max is given twice");
+            if (!parse_number(argv[i + 1], fsize_max) || fsize_max == 0 || fsize_max > MAX_FSIZE)
+                fatal("--fsize_max must be 1-" + std::to_string(MAX_FSIZE) + " bytes");
+
+            i += 2;
+
         } else {
             print_usage();
         }
@@ -1634,5 +1667,5 @@ int main(int argc, char *argv[]) {
     cmd_env.push_back(nullptr);
 
     return execute(cmd, cmd_args, cmd_env, flags, cgroup, cpu_set, cpu_max, mem_limit, no_swap, oom_group,
-                   usage_stat_file, exec_dir, uid, tmp_size, stop_fifo);
+                   usage_stat_file, exec_dir, uid, tmp_size, stop_fifo, fsize_max);
 }
