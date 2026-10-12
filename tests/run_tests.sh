@@ -438,29 +438,27 @@ test_runs_as_nobody() {
 test_network_isolation() {
     echo "[network isolation]"
 
-    # With isolation: should see no real interfaces
-    local out
-    out=$(sbox netiso \
-        --add_elf_file /bin/ls /bin/ls \
-        -- /bin/ls /proc/net/ 2>&1) || true
-    # Isolated network namespace has minimal /proc/net
-    pass "sandbox runs with network isolation"
+    # /proc in the sandbox holds only processes, so the interfaces are read from /proc/self/net/dev
+    local out iface iface_re
+    iface=$(awk -F: 'NR > 2 { gsub(/ /, "", $1); if ($1 != "lo") { print $1; exit } }' /proc/net/dev)
+    iface_re=$(printf '%s' "$iface" | sed 's/[][\.*^$+?(){}|/]/\\&/g')
 
-    # With --no_new_net: should see host interfaces
+    out=$(sbox netiso \
+        --add_elf_file /bin/cat /bin/cat \
+        -- /bin/cat /proc/self/net/dev 2>&1) || true
+    assert_output_contains "$out" "^ *lo:" "an isolated sandbox has its own lo"
+
+    if [ -z "$iface" ]; then
+        echo "  SKIP: the host has no interface but lo to look for"
+        return
+    fi
+    assert_output_not_contains "$out" "^ *$iface_re:" "an isolated sandbox does not see the host's $iface"
+
     out=$(sbox netshare \
         --add_elf_file /bin/cat /bin/cat \
         --no_new_net \
-        -- /bin/cat /proc/net/if_inet6 2>&1) || true
-    if echo "$out" | grep -qE "lo|eth|wl|en"; then
-        pass "--no_new_net exposes host network"
-    else
-        # Host might not have IPv6; try /proc/net/dev instead
-        out=$(sbox netshare2 \
-            --add_elf_file /bin/cat /bin/cat \
-            --no_new_net \
-            -- /bin/cat /proc/net/dev 2>&1) || true
-        assert_output_contains "$out" "lo|eth|wl|en" "--no_new_net exposes host network"
-    fi
+        -- /bin/cat /proc/self/net/dev 2>&1) || true
+    assert_output_contains "$out" "^ *$iface_re:" "--no_new_net exposes the host's $iface"
 }
 
 test_cgroup() {
@@ -486,14 +484,16 @@ test_cgroup() {
 test_memory_limit() {
     echo "[memory limit]"
 
-    # With 10MB limit, allocating 50MB should fail (OOM kill)
-    local out
+    # With a 10MB limit and no swap, allocating 50MB is killed by OOM; with swap it could succeed
+    local out rc=0
     out=$(sbox memlimit \
         --add_file "$HELPERS_DIR/memhog" /bin/memhog \
         --cgroup "sandbox_test_mem_$$" \
         --mem_limit 10485760 \
-        -- /bin/memhog 50 2>&1)
-    assert_output_not_contains "$out" "allocated 50MB" "50MB allocation killed by OOM"
+        --no_swap \
+        -- /bin/memhog 50 2>&1) || rc=$?
+    assert_exit 137 $rc "50MB allocation killed by OOM"
+    assert_output_not_contains "$out" "allocated 50MB" "no allocation output"
 
     # Without limit, same allocation should succeed
     rc=0
