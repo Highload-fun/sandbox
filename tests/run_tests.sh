@@ -484,7 +484,7 @@ test_cgroup() {
 test_cgroup_reuse() {
     echo "[cgroup reused]"
 
-    # An empty cgroup that already exists is used as it is and removed afterwards
+    # An empty leaf cgroup that already exists is used as it is by a root caller, and removed afterwards
     local cg="sandbox_test_reuse_$$" out="$TEST_DIR/cgreuse_out.txt" procs rc=0
     mkdir "/sys/fs/cgroup/$cg"
     "$SANDBOX_BIN" "$TEST_DIR/sbox_cgreuse" \
@@ -509,6 +509,98 @@ test_cgroup_reuse() {
         fail "the cgroup is removed afterwards" "it is still there"
         rmdir "/sys/fs/cgroup/$cg" 2>/dev/null || true
     fi
+}
+
+cgroup_state() {
+    # cgroup_state <name>: the values a run could write into the cgroup, and the owner of its cgroup.kill
+    local d="/sys/fs/cgroup/$1" f
+    for f in memory.max memory.swap.max memory.oom.group pids.max cpu.max; do
+        echo "$f=$(cat "$d/$f" 2>/dev/null)"
+    done
+    echo "kill=$(stat -c %u "$d/cgroup.kill")"
+}
+
+test_cgroup_existing() {
+    echo "[existing cgroups]"
+
+    local echo_args=(--add_elf_file /bin/echo /bin/echo) rc out cg before after pids_max kill_owner
+    local refused="^--cgroup names an existing cgroup that is not an empty leaf the tool made for the caller$"
+
+    # The host's own cgroups are refused for a non-root caller before anything is written into them
+    for cg in init.scope system.slice; do
+        if [ ! -d "/sys/fs/cgroup/$cg" ]; then
+            echo "  SKIP: there is no /sys/fs/cgroup/$cg on this host"
+            continue
+        fi
+        before=$(cgroup_state "$cg")
+        pids_max=$(cat "/sys/fs/cgroup/$cg/pids.max" 2>/dev/null)
+        kill_owner=$(stat -c %u "/sys/fs/cgroup/$cg/cgroup.kill")
+        assert_refused "--cgroup $cg for a non-root caller" "$refused" \
+            caller "host_$cg" "${echo_args[@]}" --cgroup "$cg" -- /bin/echo ran
+        after=$(cgroup_state "$cg")
+        if [ "$before" = "$after" ]; then
+            pass "$cg is unchanged"
+        else
+            fail "$cg is unchanged" "it changed: $(echo $after)"
+            # A wrong build wrote into a cgroup of the host: put back what a run without limits changes
+            [ -n "$pids_max" ] && echo "$pids_max" > "/sys/fs/cgroup/$cg/pids.max"
+            chown "$kill_owner" "/sys/fs/cgroup/$cg/cgroup.kill"
+        fi
+    done
+
+    # An empty leaf made by root is refused for a non-root caller, and left in place
+    cg="sandbox_test_rootleaf_$$"
+    mkdir "/sys/fs/cgroup/$cg"
+    assert_refused "an empty root-owned leaf for a non-root caller" "$refused" \
+        caller rootleaf "${echo_args[@]}" --cgroup "$cg" -- /bin/echo ran
+    if [ -d "/sys/fs/cgroup/$cg" ]; then
+        pass "the refused cgroup is left in place"
+    else
+        fail "the refused cgroup is left in place" "it is gone"
+    fi
+
+    # A leftover the tool made for this caller, whose cgroup.kill it holds, is reused and then removed
+    chown "$CALLER_UID" "/sys/fs/cgroup/$cg/cgroup.kill"
+    rc=0
+    out=$(caller leftover "${echo_args[@]}" --cgroup "$cg" -- /bin/echo ran 2>&1) || rc=$?
+    assert_exit 0 $rc "a non-root caller reuses an empty leftover made for it"
+    assert_output_contains "$out" "^ran$" "the command runs in it"
+    if [ ! -d "/sys/fs/cgroup/$cg" ]; then
+        pass "the reused cgroup is removed afterwards"
+    else
+        fail "the reused cgroup is removed afterwards" "it is still there"
+        rmdir "/sys/fs/cgroup/$cg" 2>/dev/null || true
+    fi
+
+    # A populated cgroup and one with a child cgroup are refused for every caller, even when made for it
+    local busy="sandbox_test_busy_$$" parent="sandbox_test_parent_$$"
+    mkdir "/sys/fs/cgroup/$busy" "/sys/fs/cgroup/$parent" "/sys/fs/cgroup/$parent/child"
+    chown "$CALLER_UID" "/sys/fs/cgroup/$busy/cgroup.kill" "/sys/fs/cgroup/$parent/cgroup.kill"
+    sleep 300 &
+    local outside=$!
+    echo "$outside" > "/sys/fs/cgroup/$busy/cgroup.procs"
+    assert_refused "a populated cgroup for a root caller" "$refused" \
+        sbox busyroot "${echo_args[@]}" --cgroup "$busy" -- /bin/echo ran
+    assert_refused "a populated cgroup for a non-root caller" "$refused" \
+        caller busycaller "${echo_args[@]}" --cgroup "$busy" -- /bin/echo ran
+    assert_refused "a cgroup with a child cgroup for a root caller" "$refused" \
+        sbox parentroot "${echo_args[@]}" --cgroup "$parent" -- /bin/echo ran
+    assert_refused "a cgroup with a child cgroup for a non-root caller" "$refused" \
+        caller parentcaller "${echo_args[@]}" --cgroup "$parent" -- /bin/echo ran
+    if grep -qx "0::/$busy" "/proc/$outside/cgroup" && [ -d "/sys/fs/cgroup/$parent/child" ]; then
+        pass "the refused cgroups are left as they were"
+    else
+        fail "the refused cgroups are left as they were" "one of them changed"
+    fi
+
+    kill "$outside"
+    wait "$outside" 2>/dev/null || true
+    local i
+    for i in $(seq 50); do
+        rmdir "/sys/fs/cgroup/$busy" 2>/dev/null && break
+        sleep 0.1
+    done
+    rmdir "/sys/fs/cgroup/$parent/child" "/sys/fs/cgroup/$parent" 2>/dev/null || true
 }
 
 test_cgroup_kept_when_populated() {
@@ -1491,6 +1583,7 @@ main() {
     test_network_isolation
     test_cgroup
     test_cgroup_reuse
+    test_cgroup_existing
     test_cgroup_kept_when_populated
     test_memory_limit
     test_memory_limit_no_swap

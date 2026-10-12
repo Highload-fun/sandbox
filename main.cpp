@@ -634,8 +634,9 @@ void clean() {
     // Remove the cgroup only when it is empty. rmdir never moves processes, unlike libcgroup's delete,
     // which would move another run's processes out of a reused cgroup and free them from its limits. A
     // cgroup that still holds processes is left in place; the exit code stays the command's.
-    if (sandbox_cgroup != nullptr) {
+    if (sandbox_cgroup != nullptr)
         cgroup_free(&sandbox_cgroup);
+    if (!sandbox_cgroup_name.empty()) {
         auto path = fs::path("/sys/fs/cgroup") / sandbox_cgroup_name;
         if (rmdir(path.c_str()) && errno != ENOENT)
             std::cerr << "cannot remove cgroup " << sandbox_cgroup_name << ", left in place: " << strerror(errno)
@@ -833,6 +834,37 @@ void mount_dir(const std::string &src, const fs::path &dst) {
             fatal_errno("cannot mount dir " + src);
     close(dst_fd);
     close(src_fd);
+}
+
+// Opens the cgroup name when it exists, and accepts it only as an empty leaf: no child cgroup and no
+// process. A non-root caller may reuse only a cgroup the tool made for it earlier, whose cgroup.kill it
+// was given. The checks are made before anything is written, through the fd the child is cloned into.
+// Returns -1 when there is no such cgroup.
+int open_existing_cgroup(const std::string &name) {
+    auto path = fs::path("/sys/fs/cgroup") / name;
+    int fd = open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT)
+            return -1;
+        fatal_errno("cannot open cgroup " + name);
+    }
+
+    struct stat st;
+    bool callers = caller_uid == 0 || (fstatat(fd, "cgroup.kill", &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+                                       S_ISREG(st.st_mode) && st.st_uid == caller_uid);
+    bool leaf = true;
+    for (const auto &entry: list_dir(fd))
+        if (fstatat(fd, entry.c_str(), &st, AT_SYMLINK_NOFOLLOW) || S_ISDIR(st.st_mode))
+            leaf = false;
+    char c;
+    int procs = openat(fd, "cgroup.procs", O_RDONLY | O_CLOEXEC);
+    bool empty = procs >= 0 && read(procs, &c, 1) == 0;
+    if (procs >= 0)
+        close(procs);
+
+    if (!callers || !leaf || !empty)
+        fatal("--cgroup names an existing cgroup that is not an empty leaf the tool made for the caller");
+    return fd;
 }
 
 cgroup *create_cgroup(const std::string &name, const std::string &cpu_set, const std::string &cpu_max,
@@ -1138,6 +1170,8 @@ int execute(const fs::path &bin, const std::vector<char *> &args, const std::vec
 
     int cgroup_fd = -1;
     if (!cgroup_name.empty()) {
+        int existing_fd = open_existing_cgroup(cgroup_name);
+        // Only an accepted or new cgroup is the tool's to remove
         sandbox_cgroup_name = cgroup_name;
         sandbox_cgroup = create_cgroup(cgroup_name, cpu_set, cpu_max, mem_limit, no_swap, oom_group);
 
@@ -1160,9 +1194,18 @@ int execute(const fs::path &bin, const std::vector<char *> &args, const std::vec
         // CLONE_INTO_CGROUP closes that race entirely: parent never enters
         // the per-run cgroup, so cgroup.kill cannot reach it.
         auto cgroup_path = fs::path("/sys/fs/cgroup") / cgroup_name;
-        cgroup_fd = open(cgroup_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        if (cgroup_fd < 0)
-            fatal_errno("cannot open cgroup as fd for CLONE_INTO_CGROUP");
+        if (existing_fd >= 0) {
+            // libcgroup wrote the values by name: the name must still lead to the cgroup that was checked
+            struct stat checked, now;
+            if (fstat(existing_fd, &checked) || stat(cgroup_path.c_str(), &now) || checked.st_dev != now.st_dev ||
+                checked.st_ino != now.st_ino)
+                fatal("cgroup " + cgroup_name + " was replaced while it was set up");
+            cgroup_fd = existing_fd;
+        } else {
+            cgroup_fd = open(cgroup_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            if (cgroup_fd < 0)
+                fatal_errno("cannot open cgroup as fd for CLONE_INTO_CGROUP");
+        }
     }
 
     // SIGCHLD wakes the wait for the child through a pipe, so no exit is missed between checks
