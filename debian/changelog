@@ -22,6 +22,8 @@ sandbox (2.4.0-1) unstable; urgency=medium
   * delete a cgroup only when it is empty, never moving processes out of it
   * refuse an existing cgroup unless it is an empty leaf and, for a non-root
     caller, one the tool made for that caller
+  * claim a new cgroup with mkdir before writing into it, so two runs naming
+    it at once cannot share it
 
  -- Sergey Svistunov <sergey-svistunov@yandex.ru>  Sun, 11 Oct 2026 17:15:00 +0000
 

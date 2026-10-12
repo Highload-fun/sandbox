@@ -603,6 +603,52 @@ test_cgroup_existing() {
     rmdir "/sys/fs/cgroup/$parent/child" "/sys/fs/cgroup/$parent" 2>/dev/null || true
 }
 
+test_cgroup_in_use() {
+    echo "[cgroup in use]"
+
+    # A run makes its cgroup and hands its cgroup.kill to its caller; while it runs, neither another
+    # caller nor the same one can name that cgroup
+    local cg="sandbox_test_inuse_$$" out="$TEST_DIR/inuse_out.txt" fifo="$TEST_DIR/inuse.fifo"
+    local other=65532 other_dir="$TEST_DIR/other" echo_args=(--add_elf_file /bin/echo /bin/echo) rc=0 i
+    local refused="^--cgroup names an existing cgroup that is not an empty leaf the tool made for the caller$"
+    install -d -o "$other" -g "$other" -m 700 "$other_dir"
+    mkfifo -m 600 "$fifo"
+    chown "$CALLER_UID" "$fifo"
+
+    caller inuse \
+        --add_file "$HELPERS_DIR/sleeper" /bin/sleeper \
+        --cgroup "$cg" \
+        --stop_fifo "$fifo" \
+        -- /bin/sleeper >"$out" 2>&1 &
+    local bg_pid=$!
+    wait_for_output "$out" "sleeping"
+    # The tool hands cgroup.kill over just after the start, which may follow the command's first output
+    for i in $(seq 50); do
+        [ "$(stat -c %u "/sys/fs/cgroup/$cg/cgroup.kill" 2>/dev/null)" = "$CALLER_UID" ] && break
+        sleep 0.1
+    done
+    if [ "$(stat -c %u "/sys/fs/cgroup/$cg/cgroup.kill" 2>/dev/null)" = "$CALLER_UID" ]; then
+        pass "a new cgroup is made and its cgroup.kill given to the caller"
+    else
+        fail "a new cgroup is made and its cgroup.kill given to the caller" "cgroup.kill is not the caller's"
+    fi
+
+    assert_refused "another caller naming a cgroup in use" "$refused" \
+        caller_at "$other" "$other_dir/sb" "${echo_args[@]}" --cgroup "$cg" -- /bin/echo ran
+    assert_refused "the same caller naming its cgroup in use" "$refused" \
+        caller inuse2 "${echo_args[@]}" --cgroup "$cg" -- /bin/echo ran
+
+    write_fifo "$fifo" x
+    wait "$bg_pid" || rc=$?
+    assert_exit 0 $rc "the first run is not disturbed"
+    if [ ! -d "/sys/fs/cgroup/$cg" ]; then
+        pass "its cgroup is removed after the run"
+    else
+        fail "its cgroup is removed after the run" "it is still there"
+        rmdir "/sys/fs/cgroup/$cg" 2>/dev/null || true
+    fi
+}
+
 test_cgroup_kept_when_populated() {
     echo "[cgroup with someone else's process]"
 
@@ -1584,6 +1630,7 @@ main() {
     test_cgroup
     test_cgroup_reuse
     test_cgroup_existing
+    test_cgroup_in_use
     test_cgroup_kept_when_populated
     test_memory_limit
     test_memory_limit_no_swap

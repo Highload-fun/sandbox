@@ -867,6 +867,31 @@ int open_existing_cgroup(const std::string &name) {
     return fd;
 }
 
+// Claims the cgroup name and returns the fd of its folder. A new cgroup is made with mkdir, which only
+// one run can win; a run that loses, or finds the cgroup there, must pass open_existing_cgroup, which
+// refuses another caller's cgroup since its cgroup.kill is root's until the run starts, then that caller's.
+int claim_cgroup(const std::string &name) {
+    int fd = open_existing_cgroup(name);
+    if (fd < 0) {
+        auto path = fs::path("/sys/fs/cgroup") / name;
+        if (mkdir(path.c_str(), 0755) == 0) {
+            sandbox_cgroup_name = name;
+            fd = open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (fd < 0)
+                fatal_errno("cannot open cgroup " + name);
+            return fd;
+        }
+        if (errno != EEXIST)
+            fatal_errno("cannot create cgroup " + name);
+        fd = open_existing_cgroup(name);
+        if (fd < 0)
+            fatal("cgroup " + name + " changed while it was claimed");
+    }
+    // Only a claimed or accepted cgroup is the tool's to remove
+    sandbox_cgroup_name = name;
+    return fd;
+}
+
 cgroup *create_cgroup(const std::string &name, const std::string &cpu_set, const std::string &cpu_max,
                       uint64_t mem_limit, bool no_swap, bool oom_group) {
     if (cgroup_init())
@@ -1170,9 +1195,8 @@ int execute(const fs::path &bin, const std::vector<char *> &args, const std::vec
 
     int cgroup_fd = -1;
     if (!cgroup_name.empty()) {
-        int existing_fd = open_existing_cgroup(cgroup_name);
-        // Only an accepted or new cgroup is the tool's to remove
-        sandbox_cgroup_name = cgroup_name;
+        // libcgroup only writes the values: its mkdir finds the folder claimed here
+        cgroup_fd = claim_cgroup(cgroup_name);
         sandbox_cgroup = create_cgroup(cgroup_name, cpu_set, cpu_max, mem_limit, no_swap, oom_group);
 
         if (!cpu_max.empty()) {
@@ -1182,7 +1206,7 @@ int execute(const fs::path &bin, const std::vector<char *> &args, const std::vec
                 fatal("cannot set cpu.max");
         }
 
-        // Open the cgroup directory as an fd so clone3(CLONE_INTO_CGROUP) can
+        // The cgroup's fd, from claim_cgroup, lets clone3(CLONE_INTO_CGROUP)
         // place the child directly into it without the parent ever joining.
         // Previously the parent was attached via cgroup_attach_task and then
         // moved back to the root cgroup after clone(). Between the chown of
@@ -1193,19 +1217,13 @@ int execute(const fs::path &bin, const std::vector<char *> &args, const std::vec
         // walked into one of those orphaned mounts deleted host /usr/lib.
         // CLONE_INTO_CGROUP closes that race entirely: parent never enters
         // the per-run cgroup, so cgroup.kill cannot reach it.
+        //
+        // libcgroup wrote the values by name: the name must still lead to the folder claimed or checked
         auto cgroup_path = fs::path("/sys/fs/cgroup") / cgroup_name;
-        if (existing_fd >= 0) {
-            // libcgroup wrote the values by name: the name must still lead to the cgroup that was checked
-            struct stat checked, now;
-            if (fstat(existing_fd, &checked) || stat(cgroup_path.c_str(), &now) || checked.st_dev != now.st_dev ||
-                checked.st_ino != now.st_ino)
-                fatal("cgroup " + cgroup_name + " was replaced while it was set up");
-            cgroup_fd = existing_fd;
-        } else {
-            cgroup_fd = open(cgroup_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-            if (cgroup_fd < 0)
-                fatal_errno("cannot open cgroup as fd for CLONE_INTO_CGROUP");
-        }
+        struct stat claimed, now;
+        if (fstat(cgroup_fd, &claimed) || stat(cgroup_path.c_str(), &now) || claimed.st_dev != now.st_dev ||
+            claimed.st_ino != now.st_ino)
+            fatal("cgroup " + cgroup_name + " was replaced while it was set up");
     }
 
     // SIGCHLD wakes the wait for the child through a pipe, so no exit is missed between checks
