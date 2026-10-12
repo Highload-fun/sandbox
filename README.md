@@ -127,6 +127,10 @@ echo 1 > /sys/fs/cgroup/my_sandbox/cgroup.kill
 
 This is the only reliable way to kill sandbox processes externally — the sandbox parent runs as root and children run as nobody, so sending signals from a non-root caller would fail with EPERM. Writing to `cgroup.kill` is a kernel-level operation that atomically kills all processes in the cgroup regardless of their UIDs.
 
+## Cgroup removal
+
+On exit the tool removes the cgroup only when it is empty, and never moves processes out of it. A cgroup that still holds processes, such as one another run has reused, is left in place with a message on stderr, and the tool still exits with the command's code.
+
 ## Runtime statistics
 
 When `--save_usage_stat <file>` is used (requires `--cgroup`), sandbox collects resource usage from the cgroup after the process exits and writes it to the specified file in tab-separated format:

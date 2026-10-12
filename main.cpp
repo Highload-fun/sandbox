@@ -112,6 +112,7 @@ static int tmp_fd = -1;
 // A detached clone of the tree, the child's root to be
 static int tree_fd = -1;
 static cgroup *sandbox_cgroup = nullptr;
+static std::string sandbox_cgroup_name;
 static uid_t caller_uid;
 static gid_t caller_gid;
 
@@ -630,10 +631,15 @@ void clean() {
         tree_fd = -1;
     }
 
-    // Remove cgroups
+    // Remove the cgroup only when it is empty. rmdir never moves processes, unlike libcgroup's delete,
+    // which would move another run's processes out of a reused cgroup and free them from its limits. A
+    // cgroup that still holds processes is left in place; the exit code stays the command's.
     if (sandbox_cgroup != nullptr) {
-        cgroup_delete_cgroup(sandbox_cgroup, 0);
         cgroup_free(&sandbox_cgroup);
+        auto path = fs::path("/sys/fs/cgroup") / sandbox_cgroup_name;
+        if (rmdir(path.c_str()) && errno != ENOENT)
+            std::cerr << "cannot remove cgroup " << sandbox_cgroup_name << ", left in place: " << strerror(errno)
+                      << std::endl;
     }
 
     remove_sandbox();
@@ -1132,6 +1138,7 @@ int execute(const fs::path &bin, const std::vector<char *> &args, const std::vec
 
     int cgroup_fd = -1;
     if (!cgroup_name.empty()) {
+        sandbox_cgroup_name = cgroup_name;
         sandbox_cgroup = create_cgroup(cgroup_name, cpu_set, cpu_max, mem_limit, no_swap, oom_group);
 
         if (!cpu_max.empty()) {

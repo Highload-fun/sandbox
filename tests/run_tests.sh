@@ -481,6 +481,78 @@ test_cgroup() {
     fi
 }
 
+test_cgroup_reuse() {
+    echo "[cgroup reused]"
+
+    # An empty cgroup that already exists is used as it is and removed afterwards
+    local cg="sandbox_test_reuse_$$" out="$TEST_DIR/cgreuse_out.txt" procs rc=0
+    mkdir "/sys/fs/cgroup/$cg"
+    "$SANDBOX_BIN" "$TEST_DIR/sbox_cgreuse" \
+        --add_file "$HELPERS_DIR/sleeper" /bin/sleeper \
+        --cgroup "$cg" \
+        --stop_grace 5 \
+        -- /bin/sleeper >"$out" 2>&1 &
+    local bg_pid=$!
+    wait_for_output "$out" "sleeping"
+    procs=$(cat "/sys/fs/cgroup/$cg/cgroup.procs" 2>/dev/null)
+    if [ -n "$procs" ] && grep -q sleeper "/proc/$procs/cmdline" 2>/dev/null; then
+        pass "the command runs in the existing cgroup"
+    else
+        fail "the command runs in the existing cgroup" "cgroup.procs holds [$procs]"
+    fi
+    kill -TERM "$bg_pid"
+    wait "$bg_pid" || rc=$?
+    assert_exit 0 $rc "the run ends with the command's code"
+    if [ ! -d "/sys/fs/cgroup/$cg" ]; then
+        pass "the cgroup is removed afterwards"
+    else
+        fail "the cgroup is removed afterwards" "it is still there"
+        rmdir "/sys/fs/cgroup/$cg" 2>/dev/null || true
+    fi
+}
+
+test_cgroup_kept_when_populated() {
+    echo "[cgroup with someone else's process]"
+
+    # A process moved into the run's cgroup from outside, like another run reusing it, is never moved
+    # out: the cgroup is left in place with it
+    local cg="sandbox_test_keep_$$" out="$TEST_DIR/cgkeep_out.txt" rc=0
+    "$SANDBOX_BIN" "$TEST_DIR/sbox_cgkeep" \
+        --add_file "$HELPERS_DIR/sleeper" /bin/sleeper \
+        --cgroup "$cg" \
+        --stop_grace 5 \
+        -- /bin/sleeper >"$out" 2>&1 &
+    local bg_pid=$!
+    wait_for_output "$out" "sleeping"
+    sleep 300 &
+    local outside=$!
+    echo "$outside" > "/sys/fs/cgroup/$cg/cgroup.procs"
+    kill -TERM "$bg_pid"
+    wait "$bg_pid" || rc=$?
+
+    assert_exit 0 $rc "the run keeps the command's code"
+    assert_output_contains "$(cat "$out")" "^cannot remove cgroup $cg, left in place: Device or resource busy$" \
+        "the cgroup left in place is reported"
+    if grep -qx "0::/$cg" "/proc/$outside/cgroup"; then
+        pass "the outside process is still in the cgroup, not moved to its parent"
+    else
+        fail "the outside process is still in the cgroup, not moved to its parent" "$(cat "/proc/$outside/cgroup")"
+    fi
+    if [ -d "/sys/fs/cgroup/$cg" ]; then
+        pass "the cgroup is left in place"
+    else
+        fail "the cgroup is left in place" "it is gone"
+    fi
+
+    kill "$outside"
+    wait "$outside" 2>/dev/null || true
+    local i
+    for i in $(seq 50); do
+        rmdir "/sys/fs/cgroup/$cg" 2>/dev/null && break
+        sleep 0.1
+    done
+}
+
 test_memory_limit() {
     echo "[memory limit]"
 
@@ -1418,6 +1490,8 @@ main() {
     test_runs_as_nobody
     test_network_isolation
     test_cgroup
+    test_cgroup_reuse
+    test_cgroup_kept_when_populated
     test_memory_limit
     test_memory_limit_no_swap
     test_no_swap_requires_mem_limit
