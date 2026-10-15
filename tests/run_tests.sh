@@ -1105,6 +1105,14 @@ test_memlimit_requires_cgroup() {
         --mem_limit 10485760 \
         -- /bin/echo test 2>&1) || true
     assert_output_contains "$out" "without cgroup" "mem_limit rejected without --cgroup"
+
+    local echo_args=(--add_elf_file /bin/echo /bin/echo)
+    assert_refused "--mem_limit 0" "^--mem_limit must be a positive number of bytes$" \
+        sbox memzero "${echo_args[@]}" --cgroup "sandbox_test_memzero_$$" --mem_limit 0 -- /bin/echo ran
+    assert_refused "--mem_limit with a suffix" "^--mem_limit must be a positive number of bytes$" \
+        sbox memsuffix "${echo_args[@]}" --cgroup "sandbox_test_memsuffix_$$" --mem_limit 10m -- /bin/echo ran
+    assert_refused "--mem_limit with a sign" "^--mem_limit must be a positive number of bytes$" \
+        sbox memsign "${echo_args[@]}" --cgroup "sandbox_test_memsign_$$" --mem_limit +10485760 -- /bin/echo ran
 }
 
 test_version() {

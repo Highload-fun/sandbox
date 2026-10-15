@@ -48,7 +48,7 @@ The `<sandbox_path>` is a temporary directory created by the tool to serve as th
 | `--no_new_net` | Share the host network namespace instead of isolating |
 | `--cgroup <name>` | Run the process in a named cgroup |
 | `--cpuset <list>` | Restrict to specific CPUs (e.g. `0,1,2`) |
-| `--mem_limit <bytes>` | Set a memory limit (requires `--cgroup`) |
+| `--mem_limit <bytes>` | Set a memory limit, a positive number of bytes (requires `--cgroup`) |
 | `--no_swap` | Forbid swap, so the memory limit is a hard limit (requires `--mem_limit`) |
 | `--oom_group` | Kill every process of the sandbox when the OOM killer kills one (requires `--mem_limit`) |
 | `--save_usage_stat <file>` | Write CPU and memory usage stats after execution |

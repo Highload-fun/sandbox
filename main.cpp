@@ -1394,8 +1394,8 @@ args:
     --cpuset list
         Specifies the CPUs that are permitted to access
 
-    --mem_limit 0
-        Limit memory for a process
+    --mem_limit <bytes>
+        Limit memory for a process (requires --cgroup)
 
     --no_swap
         Forbid swap for a process (requires --mem_limit)
@@ -1585,7 +1585,8 @@ int main(int argc, char *argv[]) {
             if (i + 2 > argc || strncmp(argv[i + 1], "--", 2) == 0)
                 print_usage();
 
-            mem_limit = std::strtoll(argv[i + 1], nullptr, 10);
+            if (!parse_number(argv[i + 1], mem_limit) || mem_limit == 0)
+                fatal("--mem_limit must be a positive number of bytes");
 
             i += 2;
 
