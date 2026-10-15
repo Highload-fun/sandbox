@@ -1128,8 +1128,9 @@ static int _execute(void *arg) {
     if (setrlimit(RLIMIT_NOFILE, &caller_nofile))
         fatal_errno("cannot restore the open file limit");
 
-    // Close leaked file descriptors (fix: FD leak into sandbox)
-    syscall(SYS_close_range, 3, ~0U, 0);
+    // Close leaked file descriptors (fix: FD leak into sandbox); a kernel without close_range is refused
+    if (syscall(SYS_close_range, 3, ~0U, 0))
+        fatal_errno("cannot close inherited file descriptors");
 
     execve(opts->bin_path.c_str(), opts->args.data(), opts->env.data());
     fatal("cannot run file: " + std::string(strerror(errno)));
