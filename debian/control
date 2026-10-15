@@ -1,7 +1,7 @@
 Source: sandbox
 Section: unknown
 Priority: optional
-Maintainer: Sergei Svistunov <sergei-svistunov@yandex.ru>
+Maintainer: Sergey Svistunov <sergei-svistunov@yandex.ru>
 Build-Depends: debhelper (>= 10)
 Standards-Version: 4.1.2
 #Vcs-Git: https://anonscm.debian.org/git/collab-maint/sandbox.git

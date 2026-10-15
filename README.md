@@ -4,9 +4,9 @@ A lightweight Linux container tool that isolates program execution using Linux n
 
 ## Requirements
 
-- Linux with cgroups v2 enabled
+- Linux 5.9 or later, and 5.14 or later with `--cgroup` (for `cgroup.kill`)
+- cgroups v2 enabled
 - Root privileges (binary is installed with SETUID bit)
-- `lsof` and `objdump` available on the host
 
 ## Build
 
