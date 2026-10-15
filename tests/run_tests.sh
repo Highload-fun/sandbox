@@ -17,6 +17,8 @@ HELPERS_DIR="$TEST_DIR/helpers"
 CALLER_UID=65533
 CALLER_BIN="$TEST_DIR/sandbox"
 CALLER_DIR="$TEST_DIR/caller"
+# A root-only file in /root, which a non-root caller cannot reach
+ROOT_FILE="/root/.sandbox_test_$$"
 PASSED=0
 FAILED=0
 ERRORS=()
@@ -47,6 +49,7 @@ cleanup() {
         [ -d "$d" ] && umount -lf "$d"/* 2>/dev/null || true
     done
     rm -rf "$TEST_DIR"
+    rm -f "$ROOT_FILE"
 }
 trap cleanup EXIT
 
@@ -1752,6 +1755,32 @@ test_copy_drops_setid() {
     assert_output_contains "$out" "^755 0$" "the root-owned copy has no set-ID bit"
 }
 
+test_sources_read_as_caller() {
+    echo "[sources are read with the caller's rights]"
+
+    local echo_args=(--add_elf_file /bin/echo /bin/echo) secret="$TEST_DIR/secret" pass_only="$TEST_DIR/pass_only"
+    local rc=0
+    install -m 600 /dev/null "$ROOT_FILE"
+    install -m 600 /dev/null "$secret"
+    install -d -m 711 "$pass_only"
+
+    assert_refused "--add_file of a file in /root" "Permission denied$" \
+        caller addroot "${echo_args[@]}" --add_file "$ROOT_FILE" /f -- /bin/echo ran
+    assert_refused "--mount_dir /root" "^cannot mount dir /root: Permission denied$" \
+        caller mountroot "${echo_args[@]}" --mount_dir /root /mnt -- /bin/echo ran
+    # The caller can reach these but not read them
+    assert_refused "--add_file of a file the caller cannot read" "^cannot read $secret: Permission denied$" \
+        caller addsecret "${echo_args[@]}" --add_file "$secret" /f -- /bin/echo ran
+    assert_refused "--mount_dir of a folder the caller can only pass through" \
+        "^cannot mount dir $pass_only: Permission denied$" \
+        caller mountpass "${echo_args[@]}" --mount_dir "$pass_only" /mnt -- /bin/echo ran
+
+    sbox rootsecret "${echo_args[@]}" --add_file "$secret" /f --mount_dir "$pass_only" /mnt \
+        -- /bin/echo ran >/dev/null 2>&1 || rc=$?
+    assert_exit 0 $rc "a root caller still puts in what only root can read"
+    rm -f "$ROOT_FILE"
+}
+
 # ================================================================
 #                            MAIN
 # ================================================================
@@ -1830,6 +1859,7 @@ main() {
     test_mount_rules
     test_copy_drops_setid
     test_foreign_setid_copied
+    test_sources_read_as_caller
     test_link_during_placement
     test_fsize_max
     test_deep_tree

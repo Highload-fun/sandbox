@@ -746,17 +746,13 @@ void libs_deps(const std::string &bin, std::vector<std::string> &res) {
     }
 }
 
-// Copies the regular file src, a /proc/self/fd link, to name in dir_fd, as root, with its mode but no
-// set-ID bits
-static void copy_file_into(const std::string &src, const struct stat &st, int dir_fd, const std::string &name) {
-    int in = open(src.c_str(), O_RDONLY | O_CLOEXEC);
-    if (in < 0)
-        fatal_errno("cannot read file to copy " + name);
+// Copies the regular file in, open for reading, to name in dir_fd, as root, with its mode but no set-ID
+// bits
+static void copy_file_into(int in, const struct stat &st, int dir_fd, const std::string &name) {
     int out = openat(dir_fd, name.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (out < 0) {
         if (errno != EEXIST)
             fatal_errno("cannot copy file to " + name);
-        close(in);
         return;
     }
 
@@ -773,40 +769,59 @@ static void copy_file_into(const std::string &src, const struct stat &st, int di
     if (n < 0 || fchmod(out, st.st_mode & 0777))
         fatal_errno("cannot copy file to " + name);
     close(out);
-    close(in);
 }
 
-// Puts the host file src, opened with the caller's rights, at dst in the sandbox: a hard link, or a copy
-// across filesystems
-static void place_file(const std::string &src, const fs::path &dst) {
+// Opens the host file src for reading with the caller's rights, so the caller puts in only what it could
+// read itself. Only a regular file is opened for reading, and its stat is st.
+static int open_source_file(const std::string &src, struct stat &st) {
     drop_privileges("--add_file");
-    int src_fd = open(src.c_str(), O_PATH | O_CLOEXEC);
+    int path_fd = open(src.c_str(), O_PATH | O_CLOEXEC);
     int open_errno = errno;
     restore_privileges();
-    if (src_fd < 0) {
+    if (path_fd < 0) {
         errno = open_errno;
         fatal_errno("cannot resolve path: " + src);
     }
-    struct stat st;
-    if (fstat(src_fd, &st))
+    if (fstat(path_fd, &st))
         fatal_errno("cannot stat " + src);
     if (!S_ISREG(st.st_mode))
         fatal("add_file source must be a regular file: " + src);
+
+    // The same file is opened again, now with the caller's read rights checked
+    auto same_file = "/proc/self/fd/" + std::to_string(path_fd);
+    drop_privileges("--add_file");
+    int fd = open(same_file.c_str(), O_RDONLY | O_CLOEXEC);
+    open_errno = errno;
+    restore_privileges();
+    close(path_fd);
+    if (fd < 0) {
+        errno = open_errno;
+        fatal_errno("cannot read " + src);
+    }
+    if (fstat(fd, &st))
+        fatal_errno("cannot stat " + src);
+    return fd;
+}
+
+// Puts the host file src at dst in the sandbox: a hard link, or a copy across filesystems
+static void place_file(const std::string &src, const fs::path &dst) {
+    struct stat st;
+    int src_fd = open_source_file(src, st);
 
     auto name = dst.filename().string();
     if (name.empty() || name == ".")
         fatal("add_file destination must name a file: " + dst.string());
     int dir_fd = open_beneath(dst.parent_path().relative_path(), true);
 
-    // Someone else's set-ID file is copied for a non-root caller, so no new link keeps its inode alive
     auto src_link = "/proc/self/fd/" + std::to_string(src_fd);
+    // Someone else's set-ID file is copied for a non-root caller, so no new link keeps its inode alive
     bool foreign_setid = caller_uid != 0 && st.st_uid != caller_uid && (st.st_mode & (S_ISUID | S_ISGID));
     if (foreign_setid) {
-        copy_file_into(src_link, st, dir_fd, name);
+        copy_file_into(src_fd, st, dir_fd, name);
     } else if (linkat(AT_FDCWD, src_link.c_str(), dir_fd, name.c_str(), AT_SYMLINK_FOLLOW) && errno != EEXIST) {
         if (errno != EXDEV)
             fatal_errno("cannot create hardlink " + src + "->" + dst.string());
-        copy_file_into(src_link, st, dir_fd, name);
+        copy_file_into(src_fd, st, dir_fd, name);
     }
     close(dir_fd);
     close(src_fd);
@@ -832,8 +847,9 @@ void mount_dir(const std::string &src, const fs::path &dst) {
     if (rel.empty())
         fatal("mount destination must not be the sandbox root");
 
+    // The caller must be able to read the folder, not only to reach it
     drop_privileges("--mount_dir");
-    int src_fd = open(src.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
+    int src_fd = open(src.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     int open_errno = errno;
     restore_privileges();
     if (src_fd < 0) {
@@ -1328,7 +1344,8 @@ void print_usage() {
     sandbox <sandbox path> [args] -- <cmd to execute> [cmd args]
 
     The sandbox path's parent must be the caller's own folder, or a root-owned sticky folder that everyone
-    may write, such as /tmp. Files are put in place before folders are mounted.
+    may write, such as /tmp. Files are put in place before folders are mounted. Host files and folders are
+    opened with the caller's rights and must be readable by it.
 args:
     --add_file <src host path> <dst sandbox path>
         Copy a regular file from a host system to a sandbox

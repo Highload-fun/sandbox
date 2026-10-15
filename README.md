@@ -101,6 +101,8 @@ Before it removes that folder, the tool kills what the earlier run left running 
 
 The tool builds and removes the tree through file descriptors, never by its path: it follows no link inside the tree, enters no mount when it removes it, and a rename of the folder during a run redirects nothing. `/tmp` in the tree becomes writable by others, sticky (1777), only once everything is in place. The removal walks the tree without recursion and keeps a bounded number of folders open, moving a deeper subtree up as it goes, so a tree of any depth is removed. `ldd` runs as the caller, on the host's file.
 
+The sources of `--add_file`, `--add_elf_file` and `--mount_dir` are opened with the caller's rights, for reading, so a caller cannot put into the sandbox a file or a folder it could not read itself; a source the caller cannot read is refused with "Permission denied".
+
 ## Own UID
 
 `--uid <uid>` runs the command under that UID and the same GID, with no supplementary groups. The tool checks the IDs after the drop and refuses to run the command otherwise. It accepts only a UID that:
