@@ -119,6 +119,8 @@ static cgroup *sandbox_cgroup = nullptr;
 static std::string sandbox_cgroup_name;
 static uid_t caller_uid;
 static gid_t caller_gid;
+// The open file limit the tool was started with, which the command gets back
+static struct rlimit caller_nofile;
 
 void fatal(const std::string &message) {
     std::cerr << message << std::endl;
@@ -1123,6 +1125,9 @@ static int _execute(void *arg) {
             fatal_errno("cannot limit file size");
     }
 
+    if (setrlimit(RLIMIT_NOFILE, &caller_nofile))
+        fatal_errno("cannot restore the open file limit");
+
     // Close leaked file descriptors (fix: FD leak into sandbox)
     syscall(SYS_close_range, 3, ~0U, 0);
 
@@ -1454,6 +1459,15 @@ int main(int argc, char *argv[]) {
 
     if (setreuid(0, 0))
         fatal_errno("cannot set reuid");
+
+    // The removal walk keeps up to MAX_WALK_DEPTH folders open: the tool takes every descriptor the hard
+    // limit allows
+    if (getrlimit(RLIMIT_NOFILE, &caller_nofile))
+        fatal_errno("cannot read the open file limit");
+    struct rlimit nofile = caller_nofile;
+    nofile.rlim_cur = nofile.rlim_max;
+    if (setrlimit(RLIMIT_NOFILE, &nofile))
+        fatal_errno("cannot raise the open file limit");
 
     if (argc < 2 || strncmp(argv[1], "--", 2) == 0)
         print_usage();

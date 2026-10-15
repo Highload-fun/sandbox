@@ -1754,6 +1754,27 @@ test_signal_during_ldd() {
     assert_output_contains "$(cat "$out")" "^ran$" "the command runs with its libraries"
 }
 
+test_open_file_limit() {
+    echo "[open file limit]"
+
+    # A soft limit below what the removal walk keeps open: the tool raises its own to the hard limit
+    local out rc=0
+    (ulimit -Sn 64; sbox nofile \
+        --add_file "$HELPERS_DIR/deeptree" /bin/deeptree \
+        -- /bin/deeptree /tmp 1000) >/dev/null 2>&1 || rc=$?
+    assert_exit 3 $rc "the tool exits with the command's code"
+    if [ ! -e "$TEST_DIR/sbox_nofile" ]; then
+        pass "a tree of 1000 levels is removed under a soft limit of 64"
+    else
+        fail "a tree of 1000 levels is removed under a soft limit of 64" "the sandbox is still there"
+    fi
+
+    out=$( (ulimit -Sn 64; sbox nofilecmd \
+        --add_elf_file /bin/cat /bin/cat \
+        -- /bin/cat /proc/self/limits) 2>&1)
+    assert_output_contains "$out" "^Max open files +64 " "the command keeps the caller's limit"
+}
+
 test_foreign_setid_copied() {
     echo "[someone else's set-ID file is copied]"
 
@@ -1890,6 +1911,7 @@ main() {
     test_sources_read_as_caller
     test_link_during_placement
     test_signal_during_ldd
+    test_open_file_limit
     test_fsize_max
     test_deep_tree
     test_deep_mounts
