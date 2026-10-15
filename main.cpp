@@ -640,6 +640,15 @@ void clean() {
         return;
     entered = true;
 
+    // A fatal error after the start leaves the child running: it must not outlive the tool, nor write into
+    // the tree while it is removed
+    if (pid > 0) {
+        kill(pid, SIGKILL);
+        while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {
+        }
+        pid = 0;
+    }
+
     // An open clone keeps the tree's mount points busy
     if (tree_fd >= 0) {
         close(tree_fd);
@@ -1178,8 +1187,11 @@ int wait_child(int wake_read_fd, int stop_fifo) {
     for (;;) {
         int wstatus;
         pid_t r = waitpid(pid, &wstatus, WNOHANG);
-        if (r == pid)
+        if (r == pid) {
+            // Reaped: no signal or cleanup may reach the PID any more
+            pid = 0;
             return wstatus;
+        }
         if (r == -1 && errno != EINTR)
             fatal_errno("waitpid failed");
 
