@@ -1758,8 +1758,14 @@ test_signal_during_ldd() {
     write_fifo "$pause" go
     wait "$bg_pid" || rc=$?
 
-    assert_exit 0 $rc "a SIGTERM during ldd does not cut its output short"
-    assert_output_contains "$(cat "$out")" "^ran$" "the command runs with its libraries"
+    # The forwarded SIGTERM may reach the command before or after its exec, so it exits 0 or 143; a cut
+    # dependency list fails the start instead
+    assert_output_not_contains "$(cat "$out")" "cannot run file" "a SIGTERM during ldd does not cut its output short"
+    case $rc in
+        0) assert_output_contains "$(cat "$out")" "^ran$" "the command runs with its libraries" ;;
+        143) pass "the command started with its libraries and took the forwarded SIGTERM" ;;
+        *) fail "the command runs with its libraries" "expected exit 0 or 143, got $rc" ;;
+    esac
 }
 
 test_open_file_limit() {

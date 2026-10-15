@@ -103,7 +103,7 @@ static volatile sig_atomic_t got_signal = 0;
 static volatile sig_atomic_t stop_grace = 0;
 // Write end of the pipe that wakes the wait for the child
 static volatile sig_atomic_t wake_fd = -1;
-static pid_t pid;
+static volatile pid_t pid;
 static bool is_child = false;
 // The sandbox path: its parent is opened once, with the caller's rights, and then the tree is reached only
 // through parent_fd and sandbox_fd
