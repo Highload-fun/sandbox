@@ -500,14 +500,22 @@ static void remove_leaf(const struct stat &dir) {
         fatal_errno("cannot remove sandbox");
 }
 
-static bool is_folder(const std::string &path, const struct stat &dir) {
-    struct stat st;
-    return stat(path.c_str(), &st) == 0 && st.st_dev == dir.st_dev && st.st_ino == dir.st_ino;
+// Reports whether path leads to the file st
+static bool leads_to(const std::string &path, const struct stat &st) {
+    struct stat now;
+    return stat(path.c_str(), &now) == 0 && now.st_dev == st.st_dev && now.st_ino == st.st_ino;
 }
 
-// Kills what an earlier run on this sandbox path left running: the processes of root, the caller,
-// nobody or the --uid range whose root, working folder or an open file is the folder dir
+// Kills what an earlier run on this sandbox path left running. A process of the caller, nobody or the
+// --uid range is killed when its root, working folder or an open file is the folder dir. A root process
+// is killed only when its root is dir, as an earlier run's command has, or when it is this tool and its
+// working folder or an open file is dir, as an earlier run of the tool; no other root process is the
+// caller's to kill.
 static void kill_processes_using(const struct stat &dir) {
+    struct stat tool;
+    if (stat("/proc/self/exe", &tool))
+        fatal_errno("cannot stat the tool");
+
     std::vector<pid_t> pids;
     DIR *proc = opendir("/proc");
     if (!proc)
@@ -524,12 +532,15 @@ static void kill_processes_using(const struct stat &dir) {
                                          (st.st_uid >= UID_RANGE_MIN && st.st_uid <= UID_RANGE_MAX)))
             continue;
 
-        bool uses = is_folder(base + "/root", dir) || is_folder(base + "/cwd", dir);
-        if (DIR *fds = uses ? nullptr : opendir((base + "/fd").c_str())) {
-            while (auto fd = readdir(fds))
-                if (fd->d_name[0] != '.' && is_folder(base + "/fd/" + fd->d_name, dir))
-                    uses = true;
-            closedir(fds);
+        bool uses = leads_to(base + "/root", dir);
+        if (!uses && (st.st_uid != 0 || leads_to(base + "/exe", tool))) {
+            uses = leads_to(base + "/cwd", dir);
+            if (DIR *fds = uses ? nullptr : opendir((base + "/fd").c_str())) {
+                while (auto fd = readdir(fds))
+                    if (fd->d_name[0] != '.' && leads_to(base + "/fd/" + fd->d_name, dir))
+                        uses = true;
+                closedir(fds);
+            }
         }
         if (uses)
             pids.push_back(static_cast<pid_t>(p));

@@ -150,6 +150,27 @@ wait_for_output() {
     return 1
 }
 
+wait_for_link() {
+    # wait_for_link <link> <target>: waits up to 5 s for a link, such as /proc/<pid>/cwd, to lead to target
+    local i
+    for i in $(seq 50); do
+        [ "$(readlink "$1" 2>/dev/null)" = "$2" ] && return 0
+        sleep 0.1
+    done
+    fail "wait for $1 to lead to $2" "timed out"
+    return 1
+}
+
+wait_gone() {
+    # wait_gone <pid>: waits up to 5 s for a process that is not this shell's child to end
+    local i
+    for i in $(seq 50); do
+        case "$(ps -o stat= -p "$1")" in "" | Z*) return 0 ;; esac
+        sleep 0.1
+    done
+    return 1
+}
+
 write_fifo() {
     # write_fifo <fifo> [<bytes>]: writes the bytes, or only opens and closes the FIFO; gives up after 5 s
     timeout 5 sh -c 'printf "$2" > "$1"' sh "$1" "${2:-}"
@@ -1433,6 +1454,60 @@ test_earlier_sandbox() {
         caller link "${echo_args[@]}" -- /bin/echo ran
 }
 
+test_earlier_run_processes() {
+    echo "[processes in an earlier sandbox folder]"
+
+    local leaf="$CALLER_DIR/sbox_procs" echo_args=(--add_elf_file /bin/echo /bin/echo) rc=0
+    local root_cwd root_chroot caller_cwd
+    install -d -o "$CALLER_UID" -g "$CALLER_UID" "$leaf"
+    install -m 755 "$HELPERS_DIR/sleeper" "$leaf/sleeper"
+
+    # A root process that only works in the caller's folder is root's own; a root process whose root is the
+    # folder, as an earlier run's command has, and the caller's process there are the earlier run's
+    (cd "$leaf" && exec sleep 300 3<.) &
+    root_cwd=$!
+    chroot "$leaf" /sleeper >/dev/null &
+    root_chroot=$!
+    setpriv --reuid="$CALLER_UID" --regid="$CALLER_UID" --clear-groups sh -c 'cd "$1" && exec sleep 300' sh "$leaf" &
+    caller_cwd=$!
+    wait_for_link "/proc/$root_cwd/fd/3" "$leaf"
+    wait_for_link "/proc/$root_chroot/root" "$leaf"
+    wait_for_link "/proc/$caller_cwd/cwd" "$leaf"
+
+    caller procs "${echo_args[@]}" -- /bin/echo ran >/dev/null 2>&1 || rc=$?
+    assert_exit 0 $rc "a run replaces a folder that processes use"
+    if kill -0 "$root_cwd" 2>/dev/null; then
+        pass "a root process with its working folder and a file there is not killed"
+    else
+        fail "a root process with its working folder and a file there is not killed" "it is gone"
+    fi
+    rc=0; wait "$root_chroot" || rc=$?
+    assert_exit 137 $rc "a root process whose root is the folder is killed"
+    rc=0; wait "$caller_cwd" || rc=$?
+    assert_exit 137 $rc "the caller's process working there is killed"
+    kill "$root_cwd" 2>/dev/null
+    wait "$root_cwd" 2>/dev/null
+
+    # An earlier run of the tool that still holds its folder is killed, and so is its command
+    local out="$TEST_DIR/procs_tool.txt" tool child
+    "$SANDBOX_BIN" "$TEST_DIR/sbox_tool" \
+        --add_file "$HELPERS_DIR/sleeper" /bin/sleeper \
+        -- /bin/sleeper >"$out" 2>&1 &
+    tool=$!
+    wait_for_output "$out" "sleeping"
+    child=$(pgrep -P "$tool")
+    rc=0
+    sbox tool "${echo_args[@]}" -- /bin/echo ran >/dev/null 2>&1 || rc=$?
+    assert_exit 0 $rc "a run replaces a folder that an earlier run of the tool holds"
+    rc=0; wait "$tool" || rc=$?
+    assert_exit 137 $rc "the earlier run of the tool is killed"
+    if [ -n "$child" ] && wait_gone "$child"; then
+        pass "the earlier run's command is killed"
+    else
+        fail "the earlier run's command is killed" "pid [$child] is still there"
+    fi
+}
+
 test_links_planted_by_the_command() {
     echo "[links planted by the command]"
 
@@ -1749,6 +1824,7 @@ main() {
     test_stop_fifo_refused
     test_sandbox_parent
     test_earlier_sandbox
+    test_earlier_run_processes
     test_links_planted_by_the_command
     test_sandbox_moved
     test_mount_rules

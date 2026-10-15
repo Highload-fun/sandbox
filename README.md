@@ -97,6 +97,8 @@ The sandbox path's parent must be the caller's own folder, or a root-owned stick
 
 A folder already at the sandbox path, left by an earlier run, is removed first. It must be the caller's, or root's in the caller's own parent; in a shared parent such as `/tmp` a root-owned folder may be anyone's, so the tool refuses it. A link at the sandbox path is refused.
 
+Before it removes that folder, the tool kills what the earlier run left running in it: processes of the caller, of nobody and of the `--uid` range whose root, working folder or an open file is the folder. Root's processes are killed only when their root is the folder, as an earlier run's command has, or when they are this tool and use the folder, as an earlier run of it does; root's other processes are never the caller's to kill.
+
 The tool builds and removes the tree through file descriptors, never by its path: it follows no link inside the tree, enters no mount when it removes it, and a rename of the folder during a run redirects nothing. `/tmp` in the tree becomes writable by others, sticky (1777), only once everything is in place. The removal walks the tree without recursion and keeps a bounded number of folders open, moving a deeper subtree up as it goes, so a tree of any depth is removed. `ldd` runs as the caller, on the host's file.
 
 ## Own UID
