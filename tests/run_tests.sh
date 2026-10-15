@@ -1726,6 +1726,34 @@ test_link_during_placement() {
     fi
 }
 
+test_signal_during_ldd() {
+    echo "[signal while ldd runs]"
+
+    if ! head -1 /usr/bin/ldd | grep -q bash; then
+        echo "  SKIP: /usr/bin/ldd is not a bash script, so BASH_ENV cannot hold the tool in it"
+        return
+    fi
+
+    # ldd reads BASH_ENV, says it started and waits on the FIFO; SIGTERM then interrupts the tool's read of
+    # its output, which must go on, so the libraries are still put in
+    local pause="$TEST_DIR/ldd.fifo" hook="$TEST_DIR/ldd.sh" started="$TEST_DIR/ldd.started"
+    local out="$TEST_DIR/ldd_out.txt" rc=0
+    mkfifo -m 600 "$pause"
+    printf 'touch %q\nread -r _ < %q\n' "$started" "$pause" > "$hook"
+    BASH_ENV="$hook" "$SANDBOX_BIN" "$TEST_DIR/sbox_lddsignal" \
+        --add_elf_file /bin/echo /bin/echo \
+        --stop_grace 5 \
+        -- /bin/echo ran >"$out" 2>&1 &
+    local bg_pid=$!
+    wait_for_path "$started"
+    kill -TERM "$bg_pid"
+    write_fifo "$pause" go
+    wait "$bg_pid" || rc=$?
+
+    assert_exit 0 $rc "a SIGTERM during ldd does not cut its output short"
+    assert_output_contains "$(cat "$out")" "^ran$" "the command runs with its libraries"
+}
+
 test_foreign_setid_copied() {
     echo "[someone else's set-ID file is copied]"
 
@@ -1861,6 +1889,7 @@ main() {
     test_foreign_setid_copied
     test_sources_read_as_caller
     test_link_during_placement
+    test_signal_during_ldd
     test_fsize_max
     test_deep_tree
     test_deep_mounts

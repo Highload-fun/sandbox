@@ -174,14 +174,22 @@ std::string exec_as_caller(const char *path, std::vector<const char *> args) {
 
     close(pipefd[1]);
 
+    // SIGTERM and SIGINT interrupt without SA_RESTART: a read or wait they cut short is repeated
     std::string result;
     char buf[256];
-    ssize_t n;
-    while ((n = read(pipefd[0], buf, sizeof(buf))) > 0)
-        result.append(buf, n);
+    for (;;) {
+        ssize_t n = read(pipefd[0], buf, sizeof(buf));
+        if (n > 0)
+            result.append(buf, n);
+        else if (n == 0)
+            break;
+        else if (errno != EINTR)
+            fatal_errno(std::string("cannot read the output of ") + path);
+    }
     close(pipefd[0]);
 
-    waitpid(child, nullptr, 0);
+    while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {
+    }
     return result;
 }
 
