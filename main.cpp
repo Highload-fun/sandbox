@@ -25,6 +25,12 @@
 #include <sys/sysmacros.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <dirent.h>
 #include <grp.h>            // setgroups
@@ -88,6 +94,11 @@ static_assert(UID_RANGE_MIN > NOBODY_UID && UID_RANGE_MAX < UINT32_MAX, "--uid r
 
 namespace fs = std::filesystem;
 
+struct listener_opts {
+    struct sockaddr_in addr{};
+    std::string path;
+};
+
 struct exe_opts {
     const fs::path &bin_path;
     const std::vector<char *> &args;
@@ -96,6 +107,7 @@ struct exe_opts {
     const uid_t uid;
     const std::string &tmp_mount_opts;
     const uint64_t fsize_max;
+    const listener_opts &listener;
 };
 
 static volatile sig_atomic_t got_signal = 0;
@@ -341,6 +353,23 @@ std::string parse_cpu_max(const std::string &value) {
         !parse_number(value.substr(space + 1), period))
         fatal("--cpu_max must be \"<quota_us> <period_us>\"");
     return std::to_string(quota) + " " + std::to_string(period);
+}
+
+static void parse_pass_listener(const char *value, listener_opts &l) {
+    static const std::string usage = "--pass_listener must be <127.x.x.x:port>=<absolute socket path>";
+    std::string v = value;
+    size_t eq = v.find('='), colon = v.rfind(':', eq);
+    uint64_t port = 0;
+    if (eq == std::string::npos || colon == std::string::npos ||
+        !parse_number(v.substr(colon + 1, eq - colon - 1), port) || port == 0 || port > 65535 ||
+        inet_pton(AF_INET, v.substr(0, colon).c_str(), &l.addr.sin_addr) != 1 ||
+        (ntohl(l.addr.sin_addr.s_addr) >> 24) != 127)
+        fatal(usage);
+    l.path = v.substr(eq + 1);
+    if (l.path.empty() || l.path[0] != '/' || l.path.size() >= sizeof(sockaddr_un::sun_path))
+        fatal(usage);
+    l.addr.sin_family = AF_INET;
+    l.addr.sin_port = htons(port);
 }
 
 // Opens the stop FIFO with the caller's rights and accepts only a FIFO that the caller owns and that
@@ -1047,8 +1076,60 @@ static void install_seccomp_filter() {
         fatal_errno("cannot install seccomp filter");
 }
 
+static void pass_listener(const listener_opts &l) {
+    int s = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    struct ifreq ifr{};
+    strncpy(ifr.ifr_name, "lo", IFNAMSIZ - 1);
+    if (s < 0 || ioctl(s, SIOCGIFFLAGS, &ifr))
+        fatal_errno("cannot bring lo up");
+    ifr.ifr_flags |= IFF_UP;
+    if (ioctl(s, SIOCSIFFLAGS, &ifr))
+        fatal_errno("cannot bring lo up");
+    close(s);
+
+    int lfd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (lfd < 0 || bind(lfd, reinterpret_cast<const sockaddr *>(&l.addr), sizeof(l.addr)) || listen(lfd, SOMAXCONN))
+        fatal_errno("cannot listen on the --pass_listener address");
+
+    int ufd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (ufd < 0)
+        fatal_errno("cannot create the --pass_listener socket");
+    struct sockaddr_un un{};
+    un.sun_family = AF_UNIX;
+    memcpy(un.sun_path, l.path.c_str(), l.path.size());
+    drop_privileges("--pass_listener");
+    int rc = connect(ufd, reinterpret_cast<const sockaddr *>(&un), sizeof(un));
+    int connect_errno = errno;
+    restore_privileges();
+    if (rc) {
+        errno = connect_errno;
+        fatal_errno("cannot connect to --pass_listener socket " + l.path);
+    }
+
+    char byte = 0;
+    struct iovec iov{&byte, 1};
+    alignas(struct cmsghdr) char control[CMSG_SPACE(sizeof(int))]{};
+    struct msghdr msg{};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+    struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(c), &lfd, sizeof(int));
+    if (sendmsg(ufd, &msg, MSG_NOSIGNAL) != 1)
+        fatal_errno("cannot pass the listener");
+    close(ufd);
+    close(lfd);
+}
+
 static int _execute(void *arg) {
     auto *opts = static_cast<exe_opts *>(arg);
+
+    if (!opts->listener.path.empty())
+        pass_listener(opts->listener);
 
     // pivot_root instead of chroot (fix: chroot escape)
     // Make all mounts private to prevent propagation issues with pivot_root
@@ -1248,7 +1329,7 @@ int execute(const fs::path &bin, const std::vector<char *> &args, const std::vec
             const std::string &cgroup_name, const std::string &cpu_set, const std::string &cpu_max,
             const uint64_t mem_limit, const bool no_swap, const bool oom_group, const std::string &usage_stat_file,
             const fs::path &exec_dir, const uid_t uid, const uint64_t tmp_size, const int stop_fifo,
-            const uint64_t fsize_max) {
+            const uint64_t fsize_max, const listener_opts &listener) {
 
     std::string tmp_mount_opts;
     if (tmp_size)
@@ -1261,7 +1342,7 @@ int execute(const fs::path &bin, const std::vector<char *> &args, const std::vec
     close(tmp_fd);
     tmp_fd = -1;
 
-    exe_opts opts{bin, args, env, exec_dir, uid, tmp_mount_opts, fsize_max};
+    exe_opts opts{bin, args, env, exec_dir, uid, tmp_mount_opts, fsize_max, listener};
 
     int cgroup_fd = -1;
     if (!cgroup_name.empty()) {
@@ -1388,6 +1469,11 @@ args:
     --no_new_net
         Do not isolate network
 
+    --pass_listener <127.x.x.x:port>=<socket path>
+        In the new network namespace, bring lo up, listen on the address and pass
+        the listener to the unix socket at the path, connecting with the caller's
+        rights. Refused with --no_new_net.
+
     --cgroup <name>
         Run a process in a cgroup
 
@@ -1506,6 +1592,7 @@ int main(int argc, char *argv[]) {
     uint64_t fsize_max = 0;
     uid_t uid = NOBODY_UID;
     int stop_fifo = -1;
+    listener_opts pass_listener_opts;
     bool no_swap = false;
     bool oom_group = false;
     std::vector<char *> cmd_args = {nullptr}; // reserved for cmd path
@@ -1563,6 +1650,16 @@ int main(int argc, char *argv[]) {
             ignored_flags |= CLONE_NEWNET;
 
             i++;
+
+        } else if (strcmp(argv[i], "--pass_listener") == 0) {
+            if (i + 2 > argc || strncmp(argv[i + 1], "--", 2) == 0)
+                print_usage();
+
+            if (!pass_listener_opts.path.empty())
+                fatal("--pass_listener is given twice");
+            parse_pass_listener(argv[i + 1], pass_listener_opts);
+
+            i += 2;
 
         } else if (strcmp(argv[i], "--cgroup") == 0) {
             if (i + 2 > argc || strncmp(argv[i + 1], "--", 2) == 0)
@@ -1694,6 +1791,9 @@ int main(int argc, char *argv[]) {
     if (!cpu_max.empty() && cgroup.empty())
         fatal("cannot set cpu.max without cgroup name");
 
+    if (!pass_listener_opts.path.empty() && (ignored_flags & CLONE_NEWNET))
+        fatal("--pass_listener needs a new network namespace; drop --no_new_net");
+
     // Give the parent its OWN mount namespace before any --mount_dir bind (made
     // below). Binds then exist only in this private namespace and are torn
     // down by the kernel the instant the process dies -
@@ -1731,5 +1831,5 @@ int main(int argc, char *argv[]) {
     cmd_env.push_back(nullptr);
 
     return execute(cmd, cmd_args, cmd_env, flags, cgroup, cpu_set, cpu_max, mem_limit, no_swap, oom_group,
-                   usage_stat_file, exec_dir, uid, tmp_size, stop_fifo, fsize_max);
+                   usage_stat_file, exec_dir, uid, tmp_size, stop_fifo, fsize_max, pass_listener_opts);
 }

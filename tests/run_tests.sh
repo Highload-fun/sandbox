@@ -179,6 +179,27 @@ write_fifo() {
     timeout 5 sh -c 'printf "$2" > "$1"' sh "$1" "${2:-}"
 }
 
+start_receiver() {
+    # start_receiver <socket> <file>: in the background, takes a listener from the unix socket, accepts one
+    # connection on it and saves what arrives in the file; gives up after 30 s. RECEIVER_PID is its PID.
+    cat > "$TEST_DIR/receiver.py" << 'PY'
+import socket, sys
+path, out = sys.argv[1], sys.argv[2]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(path)
+s.listen(1)
+open(path + ".ready", "w").close()
+c, _ = s.accept()
+_, fds, _, _ = socket.recv_fds(c, 1, 1)
+l = socket.socket(fileno=fds[0])
+conn, _ = l.accept()
+open(out, "wb").write(conn.recv(64))
+PY
+    timeout 30 python3 "$TEST_DIR/receiver.py" "$1" "$2" &
+    RECEIVER_PID=$!
+    wait_for_path "$1.ready"
+}
+
 # ---------- build helper binaries ----------
 
 build_helpers() {
@@ -396,6 +417,47 @@ int main(int argc, char **argv) {
 }
 C
 
+    # connect_lo: connects to 127.0.0.1:<port> and writes "passed"
+    cat > "$HELPERS_DIR/connect_lo.c" << 'C'
+#include <arpa/inet.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/socket.h>
+int main(int argc, char **argv) {
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = {0};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(atoi(argv[1]));
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (s < 0 || connect(s, (struct sockaddr *)&a, sizeof(a)) || write(s, "passed", 6) != 6) {
+        printf("connect: %s\n", strerror(errno));
+        return 1;
+    }
+    return 0;
+}
+C
+
+    # lo_state: prints whether lo is up or down
+    cat > "$HELPERS_DIR/lo_state.c" << 'C'
+#include <net/if.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+int main(void) {
+    struct ifreq r;
+    memset(&r, 0, sizeof(r));
+    strcpy(r.ifr_name, "lo");
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0 || ioctl(s, SIOCGIFFLAGS, &r)) { puts("error"); return 1; }
+    puts(r.ifr_flags & IFF_UP ? "up" : "down");
+    return 0;
+}
+C
+
     gcc -static -o "$HELPERS_DIR/memhog"    "$HELPERS_DIR/memhog.c"
     gcc -static -o "$HELPERS_DIR/forkhog"   "$HELPERS_DIR/forkhog.c"
     gcc -static -o "$HELPERS_DIR/sleeper"   "$HELPERS_DIR/sleeper.c"
@@ -406,6 +468,8 @@ C
     gcc -static -o "$HELPERS_DIR/stubborn"  "$HELPERS_DIR/stubborn.c"
     gcc -static -o "$HELPERS_DIR/deeptree"  "$HELPERS_DIR/deeptree.c"
     gcc -static -o "$HELPERS_DIR/fsizetest" "$HELPERS_DIR/fsizetest.c"
+    gcc -static -o "$HELPERS_DIR/connect_lo" "$HELPERS_DIR/connect_lo.c"
+    gcc -static -o "$HELPERS_DIR/lo_state"  "$HELPERS_DIR/lo_state.c"
 }
 
 # ================================================================
@@ -525,6 +589,64 @@ test_network_isolation() {
         --no_new_net \
         -- /bin/cat /proc/self/net/dev 2>&1) || true
     assert_output_contains "$out" "^ *$iface_re:" "--no_new_net exposes the host's $iface"
+}
+
+test_pass_listener() {
+    echo "[pass_listener]"
+
+    local sock="$TEST_DIR/listener.sock" got="$TEST_DIR/listener_got.txt" rc=0
+    start_receiver "$sock" "$got"
+    sbox listener \
+        --add_file "$HELPERS_DIR/connect_lo" /bin/connect_lo \
+        --pass_listener "127.0.0.1:3128=$sock" \
+        -- /bin/connect_lo 3128 >/dev/null 2>&1 || rc=$?
+    wait "$RECEIVER_PID"
+    assert_exit 0 $rc "the command connects to 127.0.0.1:3128 in its own network namespace"
+    assert_output_contains "$(cat "$got" 2>/dev/null)" "^passed$" "the passed listener accepts the command's connection"
+}
+
+test_lo_down_without_listener() {
+    echo "[lo down without pass_listener]"
+
+    local out rc=0
+    out=$(sbox lostate --add_file "$HELPERS_DIR/lo_state" /bin/lo_state -- /bin/lo_state 2>&1) || rc=$?
+    assert_exit 0 $rc "lo_state runs"
+    assert_output_contains "$out" "^down$" "lo stays down without --pass_listener"
+}
+
+test_pass_listener_refused() {
+    echo "[pass_listener refused]"
+
+    local echo_args=(--add_elf_file /bin/echo /bin/echo)
+    local usage="^--pass_listener must be <127.x.x.x:port>=<absolute socket path>$"
+    assert_refused "--pass_listener with --no_new_net" \
+        "^--pass_listener needs a new network namespace; drop --no_new_net$" \
+        sbox listennonet "${echo_args[@]}" --no_new_net --pass_listener 127.0.0.1:3128=/tmp/x.sock -- /bin/echo ran
+    assert_refused "--pass_listener outside 127.0.0.0/8" "$usage" \
+        sbox listenaddr "${echo_args[@]}" --pass_listener 10.0.0.1:80=/tmp/x.sock -- /bin/echo ran
+    assert_refused "--pass_listener on port 0" "$usage" \
+        sbox listenport "${echo_args[@]}" --pass_listener 127.0.0.1:0=/tmp/x.sock -- /bin/echo ran
+    assert_refused "--pass_listener to a relative socket path" "$usage" \
+        sbox listenrel "${echo_args[@]}" --pass_listener 127.0.0.1:3128=relative.sock -- /bin/echo ran
+    assert_refused "--pass_listener given twice" "^--pass_listener is given twice$" \
+        sbox listentwice "${echo_args[@]}" --pass_listener 127.0.0.1:3128=/tmp/x.sock \
+        --pass_listener 127.0.0.1:3128=/tmp/x.sock -- /bin/echo ran
+}
+
+test_pass_listener_caller_rights() {
+    echo "[pass_listener connects with the caller's rights]"
+
+    local dir="$TEST_DIR/listener_private"
+    install -d -o root -g root -m 700 "$dir"
+    start_receiver "$dir/listener.sock" "$dir/got.txt"
+    assert_refused "a socket in a folder the caller cannot reach" \
+        "^cannot connect to --pass_listener socket .*: Permission denied$" \
+        caller listenerprivate \
+        --add_file "$HELPERS_DIR/connect_lo" /bin/connect_lo \
+        --pass_listener "127.0.0.1:3128=$dir/listener.sock" \
+        -- /bin/connect_lo 3128
+    kill "$RECEIVER_PID"
+    wait "$RECEIVER_PID" 2>/dev/null
 }
 
 test_cgroup() {
@@ -1121,7 +1243,7 @@ test_version() {
     local out rc=0
     out=$("$SANDBOX_BIN" --version 2>&1) || rc=$?
     assert_exit 0 $rc "--version exits 0"
-    assert_output_contains "$out" "^2\.4\.0$" "--version prints 2.4.0"
+    assert_output_contains "$out" "^2\.5\.0$" "--version prints 2.5.0"
 }
 
 test_uid_refused() {
@@ -1880,6 +2002,10 @@ main() {
     test_exec_dir
     test_runs_as_nobody
     test_network_isolation
+    test_pass_listener
+    test_lo_down_without_listener
+    test_pass_listener_refused
+    test_pass_listener_caller_rights
     test_cgroup
     test_cgroup_reuse
     test_cgroup_existing

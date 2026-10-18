@@ -46,6 +46,7 @@ The `<sandbox_path>` is a temporary directory created by the tool to serve as th
 | `--mount_dir <src> <dst>` | Bind-mount a host directory into the sandbox, not under another mount and not at its root |
 | `--env <value>` | Set an environment variable (e.g. `--env PATH=/usr/bin`) |
 | `--no_new_net` | Share the host network namespace instead of isolating |
+| `--pass_listener <127.x.x.x:port>=<path>` | In the new network namespace, bring `lo` up, listen on the address and pass the listener to the unix socket at the absolute path, connecting with the caller's rights (refused with `--no_new_net`) |
 | `--cgroup <name>` | Run the process in a named cgroup |
 | `--cpuset <list>` | Restrict to specific CPUs (e.g. `0,1,2`) |
 | `--mem_limit <bytes>` | Set a memory limit, a positive number of bytes (requires `--cgroup`) |
@@ -88,7 +89,7 @@ sudo sandbox /tmp/sbox \
 2. Puts in the requested files and libraries, then sets up the bind mounts
 3. Optionally creates a cgroup with CPU and memory constraints
 4. Clones a child process with isolated namespaces (`CLONE_NEWNS`, `CLONE_NEWPID`, `CLONE_NEWNET`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWCGROUP`)
-5. Inside the child: makes a clone of the sandbox tree its root with `pivot_root`, mounts `/proc`, drops privileges to nobody (UID 65534) or the `--uid` one, then exec's the target binary
+5. Inside the child: with `--pass_listener`, brings `lo` up, listens on the address and passes the listener to the unix socket, connecting with the caller's rights; then makes a clone of the sandbox tree its root with `pivot_root`, mounts `/proc`, drops privileges to nobody (UID 65534) or the `--uid` one, then exec's the target binary
 6. On exit, unmounts all filesystems and removes the sandbox directory
 
 ## Sandbox path

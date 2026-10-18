@@ -1,3 +1,11 @@
+sandbox (2.5.0-1) unstable; urgency=medium
+
+  * add --pass_listener: in the new network namespace bring lo up, listen on
+    a 127.0.0.0/8 address and pass the listener to a unix socket, connecting
+    with the caller's rights; refused with --no_new_net
+
+ -- Sergey Svistunov <sergei-svistunov@yandex.ru>  Sun, 18 Oct 2026 20:34:03 +0100
+
 sandbox (2.4.0-1) unstable; urgency=medium
 
   * add --uid: run the command under a UID and GID of 2000000000-2000999999
